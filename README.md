@@ -43,8 +43,6 @@ forwarder.
 A PS2 BIOS dump is required and must come from your own console; the launcher
 warns at startup when `bios/` is empty.
 
-Support Vulkan / OpenGL and the core version Patched / Classic
-
 ### How to build
 
 Install the devkitPro Switch toolchain and portlibs:
