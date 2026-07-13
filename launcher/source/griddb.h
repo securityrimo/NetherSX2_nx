@@ -20,5 +20,9 @@ enum {
 int griddb_fetch_cover(const std::string &apiKey, const std::string &title,
                        const std::string &outPath);
 
+// Download up to maxCount PNG icons for `title` into outDir (gicon_<i>.png). Returns the count.
+int griddb_fetch_icons(const std::string &key, const std::string &title,
+                       const std::string &outDir, int maxCount);
+
 void griddb_global_init(void);  // socketInitializeDefault + curl_global_init
 void griddb_global_exit(void);

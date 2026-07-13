@@ -22,7 +22,7 @@ ROMFS		:=	romfs		# bundles the emulator cores (cores/emucore_*.so)
 
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.0.0
+APP_VERSION	:=	1.0.1
 
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
@@ -38,8 +38,9 @@ CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-# SDL2_image (covers) + libcurl (SteamGridDB; libnx TLS backend, no cacert needed).
-LIBS	:=	`$(PREFIX)pkg-config --libs $(PKGS)` -lz -lGLESv2 -lnx
+# SDL2_image (covers) + libcurl (SteamGridDB; libnx TLS backend, no cacert needed) +
+# turbojpeg (forwarder NACP icon encoding).
+LIBS	:=	`$(PREFIX)pkg-config --libs $(PKGS)` -lturbojpeg -lz -lGLESv2 -lnx
 
 #---------------------------------------------------------------------------------
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)

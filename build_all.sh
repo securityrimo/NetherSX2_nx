@@ -13,6 +13,9 @@ export DEVKITA64=$DEVKITPRO/devkitA64
 
 APP="$(cd "$(dirname "$0")" && pwd)"   # the emulator project (this folder)
 ROOT="$(dirname "$APP")"               # parent, holding the extracted core APKs
+# Where the extracted NetherSX2 core APKs (NetherSX2-v2.2n-{4248,3668}/) live.
+# Defaults to the parent folder; override with CORES_DIR=... for a different layout.
+CORES_DIR="${CORES_DIR:-$ROOT}"
 
 echo "==== emulator: Vulkan (NVK) ===="
 cd "$APP"
@@ -27,8 +30,8 @@ cp -f NetherSX2_nx.nro NetherSX2_nx_gl.nro
 
 echo "==== bundle cores + emulator binaries into the launcher romfs ===="
 mkdir -p "$APP/launcher/romfs/cores" "$APP/launcher/romfs/emu"
-cp -f "$ROOT/NetherSX2-v2.2n-4248/lib/arm64-v8a/libemucore.so" "$APP/launcher/romfs/cores/emucore_4248.so"
-cp -f "$ROOT/NetherSX2-v2.2n-3668/lib/arm64-v8a/libemucore.so" "$APP/launcher/romfs/cores/emucore_3668.so"
+cp -f "$CORES_DIR/NetherSX2-v2.2n-4248/lib/arm64-v8a/libemucore.so" "$APP/launcher/romfs/cores/emucore_4248.so"
+cp -f "$CORES_DIR/NetherSX2-v2.2n-3668/lib/arm64-v8a/libemucore.so" "$APP/launcher/romfs/cores/emucore_3668.so"
 cp -f "$APP/NetherSX2_nx_vk.nro" "$APP/launcher/romfs/emu/NetherSX2_nx_vk.nro"
 cp -f "$APP/NetherSX2_nx_gl.nro" "$APP/launcher/romfs/emu/NetherSX2_nx_gl.nro"
 
@@ -40,9 +43,13 @@ echo "==== bundle per-build resources into the launcher romfs ===="
 for b in 4248 3668; do
   rd="$APP/launcher/romfs/res/$b"
   rm -rf "$rd"; mkdir -p "$rd"
-  cp -rf "$ROOT/NetherSX2-v2.2n-$b/assets/." "$rd/"
+  cp -rf "$CORES_DIR/NetherSX2-v2.2n-$b/assets/." "$rd/"
   rm -rf "$rd/dexopt"
 done
+
+echo "==== forwarder stub (built in-tree from launcher/fwd/) ===="
+make -C "$APP/launcher/fwd" clean >/dev/null 2>&1
+make -C "$APP/launcher/fwd"
 
 echo "==== launcher (SDL2 addon) ===="
 cd "$APP/launcher"

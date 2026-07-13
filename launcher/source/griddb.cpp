@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <vector>
 
 // --- HTTP (curl, libnx TLS backend) ---------------------------------------
 static const size_t MAX_BODY = 24u * 1024 * 1024; // hard ceiling (covers are ~1 MB)
@@ -151,4 +152,52 @@ int griddb_fetch_cover(const std::string &key, const std::string &title, const s
 
   // 3) download the cover (image-sniffed)
   return http_download(coverUrl, outPath) ? GRIDDB_OK : GRIDDB_ERROR;
+}
+
+// Download up to maxCount icon candidates for `title` into outDir as gicon_<i>.png.
+// Square grids (1024/512) first, then app icons; caller scales the pick to 256. Returns count.
+int griddb_fetch_icons(const std::string &key, const std::string &title, const std::string &outDir, int maxCount) {
+  if (key.empty()) return 0;
+  std::string resp; long code = 0;
+  std::string search = "https://www.steamgriddb.com/api/v2/search/autocomplete/" + url_encode(title);
+  if (!http_get(search, key, resp, &code) || status_err(code)) return 0;
+  long gameId = 0;
+  if (!json_first_number(resp, "\"id\":", gameId)) return 0;
+
+  // Gather candidate URLs (a few extra, since some downloads may be sniffed out).
+  const int cap = maxCount * 3;
+  std::vector<std::string> urls;
+  auto collect = [&](const char *api) {
+    std::string r; long c = 0;
+    if (!http_get(api, key, r, &c) || status_err(c)) return;
+    size_t pos = 0; const std::string tag = "\"url\":\"";
+    while ((int)urls.size() < cap) {
+      size_t at = r.find(tag, pos);
+      if (at == std::string::npos) break;
+      size_t s = at + tag.size(), e = r.find('"', s);
+      if (e == std::string::npos) break;
+      std::string u = r.substr(s, e - s);
+      pos = e + 1;
+      std::string clean; clean.reserve(u.size());
+      for (size_t i = 0; i < u.size(); i++) { if (u[i] == '\\' && i + 1 < u.size()) continue; clean += u[i]; }
+      urls.push_back(clean);
+    }
+  };
+
+  char api[256];
+  snprintf(api, sizeof(api),
+           "https://www.steamgriddb.com/api/v2/grids/game/%ld?dimensions=1024x1024,512x512&types=static&mimes=image/png,image/jpeg",
+           gameId);
+  collect(api);
+  snprintf(api, sizeof(api),
+           "https://www.steamgriddb.com/api/v2/icons/game/%ld?mimes=image/png&types=static", gameId);
+  collect(api);
+
+  int saved = 0;
+  for (const auto &u : urls) {
+    if (saved >= maxCount) break;
+    char out[256]; snprintf(out, sizeof(out), "%s/gicon_%d.png", outDir.c_str(), saved);
+    if (http_download(u, out)) saved++;
+  }
+  return saved;
 }

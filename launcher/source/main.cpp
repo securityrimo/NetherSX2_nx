@@ -24,6 +24,7 @@
 #include <dirent.h>
 
 #include "griddb.h"
+#include "forwarder.h"
 
 // ---------------------------------------------------------------------------
 // paths
@@ -471,6 +472,27 @@ static void pumpStick(const SDL_Event &e){
   SDL_PushEvent(&s);
 }
 
+static SDL_GameController *g_pad=nullptr;    // set in main(); used by navRepeat()
+// Auto-repeat held dpad/stick as dpad events after a hold delay; call once per frame.
+static void navRepeat(){
+  if(!g_pad) return;
+  const int TH=18000;
+  int dir=0;
+  if(SDL_GameControllerGetButton(g_pad,SDL_CONTROLLER_BUTTON_DPAD_UP)    || SDL_GameControllerGetAxis(g_pad,SDL_CONTROLLER_AXIS_LEFTY)<-TH) dir=SDL_CONTROLLER_BUTTON_DPAD_UP;
+  else if(SDL_GameControllerGetButton(g_pad,SDL_CONTROLLER_BUTTON_DPAD_DOWN)  || SDL_GameControllerGetAxis(g_pad,SDL_CONTROLLER_AXIS_LEFTY)> TH) dir=SDL_CONTROLLER_BUTTON_DPAD_DOWN;
+  else if(SDL_GameControllerGetButton(g_pad,SDL_CONTROLLER_BUTTON_DPAD_LEFT)  || SDL_GameControllerGetAxis(g_pad,SDL_CONTROLLER_AXIS_LEFTX)<-TH) dir=SDL_CONTROLLER_BUTTON_DPAD_LEFT;
+  else if(SDL_GameControllerGetButton(g_pad,SDL_CONTROLLER_BUTTON_DPAD_RIGHT) || SDL_GameControllerGetAxis(g_pad,SDL_CONTROLLER_AXIS_LEFTX)> TH) dir=SDL_CONTROLLER_BUTTON_DPAD_RIGHT;
+  static int held=0; static Uint32 since=0,last=0;
+  Uint32 now=SDL_GetTicks();
+  if(dir!=held){ held=dir; since=now; last=now; return; }  // direction changed: the physical event moves first
+  if(!dir) return;
+  const Uint32 DELAY=360, RATE=85;
+  if(now-since<DELAY || now-last<RATE) return;
+  last=now;
+  SDL_Event s; memset(&s,0,sizeof(s)); s.type=SDL_CONTROLLERBUTTONDOWN; s.cbutton.button=(Uint8)dir;
+  SDL_PushEvent(&s);
+}
+
 // ---------------------------------------------------------------------------
 // game scanning
 // ---------------------------------------------------------------------------
@@ -685,6 +707,7 @@ static std::string browseFolder(const std::string &start) {
     bool redo = false;
     while (!redo) {
       SDL_Event e;
+      navRepeat();
       while (SDL_PollEvent(&e)) {
         pumpStick(e);
         { int tx=0,ty=0; TouchKind tk=touchFeed(e,&tx,&ty);              // touchscreen
@@ -852,6 +875,57 @@ static void renderSettings(int scr,int sel,int top,const char *ctx){
   SDL_RenderPresent(g_ren);
 }
 
+// Scrollable list popup to pick one of N values (used for settings with >2 choices).
+static int dropdown(const char *title, const char *const *labels, int n, int cur) {
+  int sel = (cur < 0 || cur >= n) ? 0 : cur, top = 0;
+  const int rowH = 52;
+  int vis = (SH - 200) / rowH; if (vis < 1) vis = 1; if (vis > n) vis = n;
+  beginScreenFx();
+  for (;;) {
+    SDL_Event e;
+    navRepeat();
+    while (SDL_PollEvent(&e)) {
+      pumpStick(e);
+      { int tx=0,ty=0; TouchKind tk=touchFeed(e,&tx,&ty);
+        if(tk==TOUCH_TAP){ int pw=SW>760?760:SW-160,px=(SW-pw)/2,ly=(SH-(90+vis*rowH))/2+70;
+          for(int r=0;r<vis&&top+r<n;r++){ int y=ly+r*rowH; if(ty>=y&&ty<y+rowH&&tx>=px&&tx<px+pw){ return top+r; } }
+        } }
+      if (e.type != SDL_CONTROLLERBUTTONDOWN) continue;
+      switch (e.cbutton.button) {
+        case SDL_CONTROLLER_BUTTON_DPAD_UP:   sel=(sel+n-1)%n; break;
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN: sel=(sel+1)%n;   break;
+        case BTN_CONFIRM: return sel;
+        case BTN_CANCEL:  return cur;
+      }
+      if(sel<top) top=sel; if(sel>=top+vis) top=sel-vis+1; if(top<0)top=0;
+    }
+    fillRect(0,0,SW,SH,(SDL_Color){10,12,18,255});
+    int pw = SW>760?760:SW-160, ph = 90 + vis*rowH, px=(SW-pw)/2, py=(SH-ph)/2;
+    fillRect(px,py,pw,ph,(SDL_Color){24,26,34,255});
+    border(px,py,pw,ph,3,COL_SEL);
+    drawTextC(g_font_big, SW/2, py+18, title, COL_VAL);
+    int ly = py+70;
+    for(int r=0;r<vis && top+r<n;r++){
+      int i=top+r, y=ly+r*rowH; bool curr=(i==sel);
+      if(curr){ fillRect(px+8,y,pw-16,rowH-4,(SDL_Color){66,56,30,235}); fillRect(px+8,y,5,rowH-4,COL_SEL); }
+      drawText(g_font, px+34, y+(rowH-TTF_FontHeight(g_font))/2, labels[i], curr?COL_VAL:COL_TXT);
+    }
+    if(n>vis){ int trH=vis*rowH,trX=px+pw-12,trY=ly; fillRect(trX,trY,4,trH,(SDL_Color){40,44,54,255});
+      int thH=trH*vis/n,dn=(n-vis>0?n-vis:1); fillRect(trX,trY+(trH-thH)*top/dn,4,thH,COL_SEL); }
+    drawFadeIn();
+    SDL_RenderPresent(g_ren);
+    SDL_Delay(8);
+  }
+}
+// Open the dropdown for an OT_CHOICE option and store the chosen value.
+static void optChoosePopup(const Opt &o) {
+  if(o.type!=OT_CHOICE || o.nch<=0) return;
+  const char* labels[32]; int n = o.nch>32?32:o.nch;
+  for(int i=0;i<n;i++) labels[i]=o.ch[i].label;
+  int idx = dropdown(o.label, labels, n, choiceIdx(o));
+  if(idx>=0 && idx<o.nch) iniSet(o.key, o.ch[idx].val);
+}
+
 // run one settings screen; may push into a submenu. `ctx` = per-game title or NULL.
 static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
   const Screen &S=g_screens[scr];
@@ -861,6 +935,7 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
   beginScreenFx();
   for(;;){
     SDL_Event e;
+    navRepeat();
     while(SDL_PollEvent(&e)){
       pumpStick(e);
       { int tx=0,ty=0; TouchKind tk=touchFeed(e,&tx,&ty);              // touchscreen
@@ -896,7 +971,9 @@ static void runSettings(int scr, SDL_GameController *pad, const char *ctx) {
             const char *tok=captureButton(pad);
             if(tok&&*tok) iniSet(o.key,tok);
             beginScreenFx();
-          } else optAdjust(o,1);
+          }
+          else if(o.type==OT_CHOICE && o.nch>2 && optEnabled(o)){ optChoosePopup(o); beginScreenFx(); } // dropdown for >2 choices
+          else optAdjust(o,1);
           break;
         }
         case BTN_CANCEL: return;
@@ -920,6 +997,7 @@ static void runSettingsRoot(SDL_GameController *pad, const char *ctx) {
   beginScreenFx();
   for(;;){
     SDL_Event e;
+    navRepeat();
     while(SDL_PollEvent(&e)){
       pumpStick(e);
       { int tx=0,ty=0; TouchKind tk=touchFeed(e,&tx,&ty);              // touchscreen
@@ -1015,6 +1093,7 @@ static bool confirmBox(const char *title, const std::vector<std::string> &lines)
   int bw=210, bh=56, bby=py+ph-bh-22, yesx=SW/2-bw-18, nox=SW/2+18;
   for(;;){
     SDL_Event e;
+    navRepeat();
     while(SDL_PollEvent(&e)){
       pumpStick(e);
       // a destructive confirm: taps count ONLY on the explicit Yes/No buttons,
@@ -1130,15 +1209,151 @@ static void downloadAllCovers() {
 }
 
 // returns 1 = launch this game, 0 = back
+// Pick an image for the forwarder icon: the game's cover or SteamGridDB icons.
+static bool pickIcon(Game &g, char *outPath, size_t outSize) {
+  std::string base = std::string(DATA_DIR) + "/forwarders", tmp = base + "/iconpick";
+  mkdir(base.c_str(),0777); mkdir(tmp.c_str(),0777);
+  if(DIR*d=opendir(tmp.c_str())){ struct dirent*e; while((e=readdir(d))) if(e->d_name[0]!='.') remove((tmp+"/"+std::string(e->d_name)).c_str()); closedir(d); }
+  std::vector<std::string> paths; struct stat st;
+  { std::string cp=coverPath(g); if(stat(cp.c_str(),&st)==0) paths.push_back(cp); }
+  std::string key = storeGet(g_global,"Wrapper/SteamGridDBKey","");
+  if(!key.empty()){
+    SDL_SetRenderDrawColor(g_ren,10,12,18,255); SDL_RenderClear(g_ren);
+    drawHeader("Choose an icon", g.title.c_str());
+    drawTextC(g_font, SW/2, SH/2, "Fetching icons from SteamGridDB...", COL_TXT);
+    SDL_RenderPresent(g_ren);
+    int nf=griddb_fetch_icons(key,g.title,tmp,14);
+    for(int i=0;i<nf;i++){ char p[300]; snprintf(p,sizeof(p),"%s/gicon_%d.png",tmp.c_str(),i); paths.push_back(p); }
+  }
+  if(paths.empty()){ toast("No icon found - add a SteamGridDB key or download a cover first"); SDL_Delay(1800); return false; }
+  int n=(int)paths.size(); std::vector<SDL_Texture*> tex(n,nullptr);
+  for(int i=0;i<n;i++) tex[i]=IMG_LoadTexture(g_ren,paths[i].c_str());
+  // Adaptive grid: up to 5 columns, cell sized so every row fits on screen.
+  int cols=n<5?n:5; if(cols<1)cols=1;
+  int rows=(n+cols-1)/cols, gap=18, top=150, bot=40;
+  int cw=(SW-80-(cols-1)*gap)/cols, ch=(SH-top-bot-(rows-1)*gap)/rows;
+  int cell=cw<ch?cw:ch; if(cell>200)cell=200; if(cell<90)cell=90;
+  int x0=(SW-(cols*cell+(cols-1)*gap))/2, y0=top;
+  int sel=0, chosen=-1; bool done=false; beginScreenFx();
+  while(!done){
+    SDL_Event e; navRepeat();
+    while(SDL_PollEvent(&e)){ pumpStick(e);
+      if(e.type!=SDL_CONTROLLERBUTTONDOWN) continue;
+      switch(e.cbutton.button){
+        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: sel=(sel+1)%n; break;
+        case SDL_CONTROLLER_BUTTON_DPAD_LEFT:  sel=(sel+n-1)%n; break;
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  sel=(sel+cols)%n; break;
+        case SDL_CONTROLLER_BUTTON_DPAD_UP:    sel=(sel-cols+n)%n; break;
+        case BTN_CONFIRM: chosen=sel; done=true; break;
+        case BTN_CANCEL:  done=true; break;
+      }
+    }
+    SDL_SetRenderDrawColor(g_ren,COL_BG.r,COL_BG.g,COL_BG.b,255); SDL_RenderClear(g_ren);
+    drawHeader("Choose an icon", g.title.c_str());
+    for(int i=0;i<n;i++){ int r=i/cols,c=i%cols, x=x0+c*(cell+gap), y=y0+r*(cell+gap);
+      if(i==sel) fillRect(x-6,y-6,cell+12,cell+12,COL_SEL);
+      fillRect(x,y,cell,cell,(SDL_Color){24,26,34,255});
+      if(tex[i]){ SDL_Rect d{x,y,cell,cell}; SDL_RenderCopy(g_ren,tex[i],nullptr,&d); }
+      else drawTextC(g_font_sm,x+cell/2,y+cell/2,"?",COL_DIM);
+    }
+    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+  }
+  for(auto t:tex) if(t) SDL_DestroyTexture(t);
+  if(chosen>=0 && chosen<n){ snprintf(outPath,outSize,"%s",paths[chosen].c_str()); return true; }
+  return false;
+}
+
+// Create + install a HOME shortcut: single window with icon picker + name/author fields.
+static void forwarderWizard(Game &g) {
+  char name[256]; snprintf(name,sizeof(name),"%s",g.title.c_str());
+  char author[128]; snprintf(author,sizeof(author),"%s","NetherSX2");
+  char icon[300]={0};
+  { struct stat st; std::string cp=coverPath(g);
+    if(stat(cp.c_str(),&st)==0) snprintf(icon,sizeof(icon),"%s",cp.c_str()); }
+  SDL_Texture *iconTex = icon[0] ? IMG_LoadTexture(g_ren, icon) : nullptr;
+
+  const int ix=110, iy=176, isz=280;                        // icon rect (left)
+  const int rx=ix+isz+70; int rw=SW-rx-90;                  // right column
+  const int nameY=196, authY=290, createY=406, fieldH=64, createH=58;
+  int sel=0; bool done=false; beginScreenFx();              // 0 icon, 1 name, 2 author, 3 create
+
+  auto edit=[&](const char *hdr, char *buf, size_t sz){ char b[256]; if(promptText(hdr, buf, b, sizeof(b)) && b[0]) snprintf(buf,sz,"%s",b); };
+  auto build=[&](){
+    if(!icon[0]){ toast("Pick an icon first"); SDL_Delay(1200); return; }
+    SDL_SetRenderDrawColor(g_ren,10,12,18,255); SDL_RenderClear(g_ren);
+    drawHeader("Creating HOME shortcut", g.title.c_str());
+    drawTextC(g_font, SW/2, SH/2, "Building + installing forwarder...", COL_TXT);
+    SDL_RenderPresent(g_ren);
+    appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
+    char err[256]={0}; bool ok=forwarder_create(g.key,name,author,icon,err,sizeof(err));
+    appletSetCpuBoostMode(ApmCpuBoostMode_Normal);
+    if(ok){ toast("HOME shortcut installed"); SDL_Delay(1800); done=true; }
+    else modalMessage("Shortcut failed", { err[0]?err:"Unknown error", "", "A HOME forwarder needs sigpatches on your CFW." });
+    beginScreenFx();
+  };
+  auto activate=[&](){
+    if(sel==0){ char p[300]; if(pickIcon(g,p,sizeof(p))){ snprintf(icon,sizeof(icon),"%s",p); if(iconTex)SDL_DestroyTexture(iconTex); iconTex=IMG_LoadTexture(g_ren,icon); } beginScreenFx(); }
+    else if(sel==1) edit("Shortcut name", name, sizeof(name));
+    else if(sel==2) edit("Author", author, sizeof(author));
+    else build();
+  };
+
+  while(!done){
+    SDL_Event e; navRepeat();
+    while(SDL_PollEvent(&e)){
+      pumpStick(e);
+      { int tx=0,ty=0; TouchKind tk=touchFeed(e,&tx,&ty);
+        if(tk==TOUCH_TAP){
+          if(tx>=ix&&tx<ix+isz&&ty>=iy&&ty<iy+isz){ sel=0; activate(); }
+          else if(ty>=nameY-6&&ty<nameY+fieldH){ sel=1; activate(); }
+          else if(ty>=authY-6&&ty<authY+fieldH){ sel=2; activate(); }
+          else if(ty>=createY-6&&ty<createY+createH){ sel=3; activate(); }
+          else if(ty>=SH-40) done=true;
+          continue;
+        }
+      }
+      if(e.type!=SDL_CONTROLLERBUTTONDOWN) continue;
+      switch(e.cbutton.button){
+        case SDL_CONTROLLER_BUTTON_DPAD_LEFT:  sel=0; break;                 // icon is on the left
+        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: if(sel==0) sel=1; break;      // back to the fields
+        case SDL_CONTROLLER_BUTTON_DPAD_UP:    sel=(sel==0)?3:(sel==1?3:sel-1); break;  // cycle the right column
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  sel=(sel==0)?1:(sel==3?1:sel+1); break;
+        case BTN_CONFIRM: activate(); break;
+        case BTN_CANCEL:  done=true; break;
+      }
+    }
+    SDL_SetRenderDrawColor(g_ren,COL_BG.r,COL_BG.g,COL_BG.b,255); SDL_RenderClear(g_ren);
+    drawHeader("Create HOME shortcut", g.title.c_str());
+    if(sel==0) fillRect(ix-6,iy-6,isz+12,isz+12,COL_SEL);
+    fillRect(ix,iy,isz,isz,(SDL_Color){24,26,34,255});
+    if(iconTex){ SDL_Rect d{ix,iy,isz,isz}; SDL_RenderCopy(g_ren,iconTex,nullptr,&d); }
+    else drawTextC(g_font_sm,ix+isz/2,iy+isz/2,"(no icon)",COL_DIM);
+    drawTextC(g_font_sm, ix+isz/2, iy+isz+20, "Icon", sel==0?COL_VAL:COL_DIM);
+    auto field=[&](int idx,int y,const char*label,const char*val){ bool cur=sel==idx;
+      if(cur){ fillRect(rx-10,y-6,rw+20,fieldH,(SDL_Color){66,56,30,235}); fillRect(rx-10,y-6,5,fieldH,COL_SEL); }
+      drawText(g_font_sm, rx, y, label, cur?COL_VAL:COL_DIM);
+      drawText(g_font, rx, y+26, val, cur?COL_VAL:COL_TXT); };
+    field(1,nameY,"Name",name);
+    field(2,authY,"Author",author);
+    { bool cur=sel==3;
+      fillRect(rx-10,createY-6,rw+20,createH, cur?(SDL_Color){44,86,44,240}:(SDL_Color){30,46,32,200});
+      if(cur) fillRect(rx-10,createY-6,5,createH,COL_SEL);
+      drawTextC(g_font, rx+rw/2, createY+12, "Create shortcut", cur?COL_VAL:(SDL_Color){150,225,150,255}); }
+    drawFadeIn(); SDL_RenderPresent(g_ren); SDL_Delay(8);
+  }
+  if(iconTex) SDL_DestroyTexture(iconTex);
+}
+
 static int perGameMenu(Game &g, SDL_GameController *pad) {
-  const char *items[] = { "Launch", "Per-game settings", "Rename game", "Download cover (SteamGridDB)", "Clear per-game settings", "Delete game (remove from SD)" };
-  int n=6, sel=0;
+  const char *items[] = { "Launch", "Per-game settings", "Rename game", "Download cover (SteamGridDB)", "Create HOME shortcut", "Clear per-game settings", "Delete game (remove from SD)" };
+  int n=7, sel=0;
   // load this game's override store
   std::string gp = std::string(GAMECFG_DIR) + "/" + g.key + ".ini";
   storeLoad(g_game, gp.c_str());
   beginScreenFx();
   for(;;){
     SDL_Event e;
+    navRepeat();
     while(SDL_PollEvent(&e)){
       pumpStick(e);
       { int tx=0,ty=0; TouchKind tk=touchFeed(e,&tx,&ty);              // touchscreen
@@ -1174,8 +1389,9 @@ static int perGameMenu(Game &g, SDL_GameController *pad) {
             }
           }
           else if(sel==3){ downloadCover(g); beginScreenFx(); }
-          else if(sel==4){ g_game.kv.clear(); remove(gp.c_str()); g.hasCfg=false; toast("Per-game settings cleared"); SDL_Delay(700); beginScreenFx(); }
-          else if(sel==5){                          // delete the game file from SD entirely
+          else if(sel==4){ forwarderWizard(g); beginScreenFx(); }
+          else if(sel==5){ g_game.kv.clear(); remove(gp.c_str()); g.hasCfg=false; toast("Per-game settings cleared"); SDL_Delay(700); beginScreenFx(); }
+          else if(sel==6){                          // delete the game file from SD entirely
             if(confirmBox("Delete game?", { g.title, "", "This permanently deletes the game file from",
                                             "the SD card. This cannot be undone." })){
               std::string disc = "sdmc:" + g.path;
@@ -1480,6 +1696,9 @@ static int gridPage(int sel,int dir,int cols,int rows,int n){
 // ---------------------------------------------------------------------------
 int main(int argc, char **argv){
   (void)argc;(void)argv;
+  // launcher's own path, so HOME forwarders chainload the right NRO.
+  extern std::string g_forwarderSelfPath;
+  if(argc>=1 && argv[0] && argv[0][0]) g_forwarderSelfPath=argv[0];
   romfsInit();
   griddb_global_init();
   SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,"1");
@@ -1497,6 +1716,7 @@ int main(int argc, char **argv){
 
   SDL_GameController *pad=nullptr;
   for(int i=0;i<SDL_NumJoysticks();i++) if(SDL_IsGameController(i)){ pad=SDL_GameControllerOpen(i); break; }
+  g_pad=pad;
 
   plInitialize(PlServiceType_User);
   PlFontData fd;
@@ -1548,15 +1768,27 @@ int main(int argc, char **argv){
   bool running=true, launch=false;
   std::string launchKey; // sanitized key of the game being launched (per-game cfg)
 
+  // Forwarder headless boot: a HOME shortcut launches us as "<launcher>.nro -g <game key>".
+  // Find that game and go straight to launch, skipping the grid UI.
+  for(int ai=1; ai+1<argc; ai++) if(strcmp(argv[ai],"-g")==0){
+    std::string wantKey=argv[ai+1];
+    for(auto &gm:g_games) if(gm.key==wantKey){
+      recordPlayed(gm.key); storeSet(g_global,"EmuCore/DiscPath",gm.path.c_str());
+      launchKey=gm.key; launch=true; running=false; break;
+    }
+    break;
+  }
+
   while(running){
     GLay L=gridLayout();
     int cols=L.cols; rows=L.rows;
 
     SDL_Event e;
+    navRepeat();
     while(SDL_PollEvent(&e)){
       pumpStick(e);
       if(e.type==SDL_QUIT){ running=false; break; }
-      if(e.type==SDL_CONTROLLERDEVICEADDED && !pad){ pad=SDL_GameControllerOpen(e.cdevice.which); continue; }
+      if(e.type==SDL_CONTROLLERDEVICEADDED && !pad){ pad=SDL_GameControllerOpen(e.cdevice.which); g_pad=pad; continue; }
       { int tx=0,ty=0,n=(int)g_games.size(); TouchKind tk=touchFeed(e,&tx,&ty);   // touchscreen
         if(tk==TOUCH_SWIPE_L||tk==TOUCH_SWIPE_R){ sel=gridPage(sel,tk==TOUCH_SWIPE_L?+1:-1,cols,rows,n); top=n?(sel/(cols*rows))*rows:0; continue; }
         if(tk==TOUCH_TAP){
