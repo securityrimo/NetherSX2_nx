@@ -67,7 +67,7 @@ static void prefs_put(const char *key, const char *val) {
   int i = prefs_find(key);
   if (i < 0) {
     if (s_count >= PREFS_MAX_ENTRIES) {
-      debugPrintf("prefs: map full (%d), dropping '%s'\n", s_count, key);
+
       return;
     }
     i = s_count++;
@@ -107,7 +107,7 @@ static char *trim(char *s) {
 static void prefs_parse_file(const char *path) {
   FILE *f = fopen(path, "r");
   if (!f) {
-    debugPrintf("prefs: no ini at '%s' (using defaults)\n", path);
+
     return;
   }
 
@@ -236,7 +236,7 @@ void prefs_init(const char *ini_path) {
   prefs_parse_file(s_ini_path);
   prefs_seed_defaults();
 
-  debugPrintf("prefs: %d entries loaded from '%s'\n", s_count, s_ini_path);
+
 }
 
 void prefs_save(void) {
@@ -245,7 +245,7 @@ void prefs_save(void) {
 
   FILE *f = fopen(s_ini_path, "w");
   if (!f) {
-    debugPrintf("prefs: failed to open '%s' for write\n", s_ini_path);
+
     return;
   }
 

@@ -1,9 +1,4 @@
-/* pthr.h -- bionic<->newlib pthread wrappers for libTTapp.so
- *
- * Ported from gm666q/lswtcs-vita (reimpl/pthr.h), adapted for devkitA64/libnx.
- * The Android pthread structs differ in layout from newlib's; these wrappers
- * reinterpret the game's storage so statically initialized mutexes/conds get
- * a real newlib object on first use.
+/* pthr.h -- bionic-to-newlib pthread wrappers
  *
  * This software may be modified and distributed under the terms
  * of the MIT license.  See the LICENSE file for details.
@@ -42,6 +37,7 @@ int pthread_equal_soloader(pthread_t t1, pthread_t t2);
 pthread_t pthread_self_soloader(void);
 int pthread_once_soloader(volatile int *once_control, void (*init_routine)(void));
 int pthread_getschedparam_soloader(pthread_t thread, int *policy, struct sched_param *param);
+void pthr_shutdown(void);
 
 int pthread_mutexattr_init_soloader(pthread_mutexattr_t *attr);
 int pthread_mutexattr_settype_soloader(pthread_mutexattr_t *attr, int type);
@@ -62,23 +58,13 @@ int pthread_mutex_unlock_soloader(pthread_mutex_t_bionic *mutex);
 int pthread_attr_init_soloader(pthread_attr_t_bionic *attr);
 int pthread_attr_setstacksize_soloader(pthread_attr_t_bionic *attr, size_t stacksize);
 
-// installs a fake RW TLS block (TPIDR_EL0) for the current thread so the
-// game's stack-protector cookie reads land on valid memory; call once per
-// thread that runs game code (the trampoline does this for spawned threads)
+// Core threads require writable bionic-compatible TLS.
 void pthr_install_fake_tls(void);
 
-// pin the calling thread to a background core (off the heavy emulation cores);
-// for threads spawned outside our pthread trampoline (audio mixer/callback)
 void pthr_pin_bg_core(void);
 
-// pin the calling thread to the dedicated EE/VM core. Call from the EE thread
-// (main.c's emu_thread) -- it is created via real pthread_create and so never
-// passes through the trampoline that pins the emucore worker threads.
 void pthr_pin_ee_core(void);
 
-// idempotent variant for threads not created through our wrapper (SDL audio
-// thread, OpenSL ThreadPool workers): installs only when TPIDR_EL0 is unset.
-// Safe to call before every excursion into game code.
 void pthr_ensure_fake_tls(void);
 
 #endif

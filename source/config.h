@@ -23,10 +23,6 @@
 // libemucore.so is self-contained (statically linked NDK r25b C++ runtime).
 #define SO_NAME "libemucore.so"
 
-// Debug logging to DATA_ROOT/debug.log (debugPrintf is a no-op when undefined).
-// Uncomment for debug builds; leave off for release (per-line SD writes cost FPS).
-// #define DEBUG_LOG 1
-#define LOG_PATH DATA_ROOT "/debug.log"
 
 // On-SD layout. Paths are plain absolute SD paths (no "sdmc:" prefix): the core's
 // PCSX2 FileSystem treats a colon as a scheme, and libnx resolves "/..." to the SD

@@ -41,6 +41,9 @@ int sched_get_priority_max_fake(int policy);
 void android_set_abort_message_fake(const char *msg);
 size_t __ctype_get_mb_cur_max_fake(void);
 int __register_atfork_fake(void);
+int __cxa_atexit_fake(void (*destructor)(void *), void *argument, void *dso_handle);
+void __cxa_finalize_fake(void *dso_handle);
+void libc_finalize_core(void);
 long sysconf_fake(int name);
 struct timespec;
 int clock_gettime_fake(int clk_id, struct timespec *tp);
@@ -120,18 +123,25 @@ int ASharedMemory_create_fake(const char *name, size_t size);
 int close_fake(int fd); // routes ashmem fds (keeps backing); real fds -> close()
 int ashmem_ioctl(int fd, unsigned long req, int *ret); // 0=handled (ashmem fd), -1=not ours
 
-// dual-view JIT write-redirect: the core executes the RX view [lo,hi) directly;
-// when its codegen WRITES there (data abort, RX isn't writable) the exception
-// handler (crash.c) decodes the store and re-issues it to the RW alias at
-// (fault_addr + delta), delta = rw - rx. Populated by mmap_fake per code arena.
-typedef struct { uintptr_t lo, hi; intptr_t delta; } JitRedirect;
-extern JitRedirect g_jit_redir[8];
-extern volatile int g_jit_redir_n;
+typedef enum {
+  FASTMEM_MODE_OFF,
+  FASTMEM_MODE_ON
+} FastmemMode;
+
+void fastmem_set_mode(FastmemMode mode);
+FastmemMode fastmem_get_mode(void);
+int sigaction_fake(int sig, const void *act, void *old_act);
+int fastmem_fault_can_dispatch(uintptr_t pc, uintptr_t fault_addr);
+int fastmem_dispatch_fault(uintptr_t pc, uintptr_t fault_addr);
+
+int jit_redirect_lookup(uintptr_t address, uintptr_t *redirected);
 
 // JIT-capable anonymous mmap (PS2 recompiler RX memory via process code memory)
 void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
 int mprotect_fake(void *addr, size_t length, int prot);
 int munmap_fake(void *addr, size_t length);
+
+void libc_memory_shutdown(void);
 
 // pthread extras
 int sem_init_fake(void **s, int pshared, unsigned int value);

@@ -1,31 +1,61 @@
 #!/usr/bin/env bash
-# Build the whole NetherSX2 Switch app from this one project folder:
-#   - the emulator (this dir) in both renderers -> NetherSX2_nx_{vk,gl}.nro
-#   - bundle those + the two cores into the launcher addon's romfs
-#   - the SDL launcher (launcher/) -> the single all-in-one NetherSX2.nro
-#
-# Run from an msys2 devkitPro login shell:
-#   /c/msys64/usr/bin/bash -lc './build_all.sh'
-set -e
+set -euo pipefail
 export DEVKITPRO=${DEVKITPRO:-/opt/devkitpro}
 export DEVKITARM=$DEVKITPRO/devkitARM
 export DEVKITA64=$DEVKITPRO/devkitA64
+JOBS=${JOBS:-18}
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || { echo "JOBS must be a positive integer." >&2; exit 1; }
 
-APP="$(cd "$(dirname "$0")" && pwd)"   # the emulator project (this folder)
-ROOT="$(dirname "$APP")"               # parent, holding the extracted core APKs
-# Where the extracted NetherSX2 core APKs (NetherSX2-v2.2n-{4248,3668}/) live.
-# Defaults to the parent folder; override with CORES_DIR=... for a different layout.
+APP="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(dirname "$APP")"
 CORES_DIR="${CORES_DIR:-$ROOT}"
+
+required=(
+  "$CORES_DIR/NetherSX2-v2.2n-4248/lib/arm64-v8a/libemucore.so"
+  "$CORES_DIR/NetherSX2-v2.2n-4248/assets/GameIndex.yaml"
+  "$CORES_DIR/NetherSX2-v2.2n-3668/lib/arm64-v8a/libemucore.so"
+  "$CORES_DIR/NetherSX2-v2.2n-3668/assets/GameIndex.yaml"
+  "$APP/vulkan/include/vulkan/vulkan_core.h"
+  "$APP/vulkan/lib/libnvk.a"
+)
+for file in "${required[@]}"; do
+  [[ -f "$file" ]] || { echo "Missing build input: $file" >&2; exit 1; }
+done
+command -v cmake >/dev/null || { echo "cmake is required." >&2; exit 1; }
+command -v ninja >/dev/null || { echo "ninja is required." >&2; exit 1; }
+
+DEPS_BUILD="$APP/launcher/dependencies/build"
+if [[ -f "$DEPS_BUILD/CMakeCache.txt" ]] &&
+   ! grep -q '^CMAKE_GENERATOR:INTERNAL=Ninja$' "$DEPS_BUILD/CMakeCache.txt"; then
+  cmake -E rm -rf "$DEPS_BUILD"
+fi
+
+echo "==== launcher storage dependencies ===="
+deps_args=(
+  -S "$APP/launcher/dependencies"
+  -B "$DEPS_BUILD"
+  -G Ninja
+  -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake"
+  -DCMAKE_BUILD_TYPE=Release
+)
+if [[ -n "${LIBSMB2_SOURCE:-}" ]]; then
+  deps_args+=( -DFETCHCONTENT_SOURCE_DIR_LIBSMB2="$LIBSMB2_SOURCE" )
+fi
+if [[ -n "${LIBUSBHSFS_SOURCE:-}" ]]; then
+  deps_args+=( -DFETCHCONTENT_SOURCE_DIR_LIBUSBHSFS="$LIBUSBHSFS_SOURCE" )
+fi
+cmake "${deps_args[@]}"
+cmake --build "$DEPS_BUILD" --parallel "$JOBS"
 
 echo "==== emulator: Vulkan (NVK) ===="
 cd "$APP"
 make clean >/dev/null 2>&1
-make RENDERER=VK
+make -j"$JOBS" RENDERER=VK
 cp -f NetherSX2_nx.nro NetherSX2_nx_vk.nro
 
 echo "==== emulator: OpenGL ===="
 make clean >/dev/null 2>&1
-make
+make -j"$JOBS"
 cp -f NetherSX2_nx.nro NetherSX2_nx_gl.nro
 
 echo "==== bundle cores + emulator binaries into the launcher romfs ===="
@@ -35,10 +65,6 @@ cp -f "$CORES_DIR/NetherSX2-v2.2n-3668/lib/arm64-v8a/libemucore.so" "$APP/launch
 cp -f "$APP/NetherSX2_nx_vk.nro" "$APP/launcher/romfs/emu/NetherSX2_nx_vk.nro"
 cp -f "$APP/NetherSX2_nx_gl.nro" "$APP/launcher/romfs/emu/NetherSX2_nx_gl.nro"
 
-# Per-build resources (assets/: shaders, GameIndex.yaml, fonts, cheats, ...). These
-# DIFFER between the two v2.2n builds (esp. the GS shaders), so pack BOTH sets and
-# let the launcher extract the one matching the chosen core. Only v2.2n is bundled
-# (no v2.1). Drop the Android ART profiles (dexopt/) -- useless on Switch.
 echo "==== bundle per-build resources into the launcher romfs ===="
 for b in 4248 3668; do
   rd="$APP/launcher/romfs/res/$b"
@@ -49,16 +75,13 @@ done
 
 echo "==== forwarder stub (built in-tree from launcher/fwd/) ===="
 make -C "$APP/launcher/fwd" clean >/dev/null 2>&1
-make -C "$APP/launcher/fwd"
+make -j"$JOBS" -C "$APP/launcher/fwd"
 
 echo "==== launcher (SDL2 addon) ===="
 cd "$APP/launcher"
 make clean >/dev/null 2>&1
-make
+make -j"$JOBS"
 
-# Leave a single .nro in the project root and drop the intermediate emulator
-# builds (they're already baked into the launcher's romfs) -- so there's exactly
-# one file to copy to the SD card.
 mv -f "$APP/launcher/NetherSX2.nro" "$APP/NetherSX2.nro"
 rm -f "$APP/NetherSX2_nx.nro" "$APP/NetherSX2_nx_vk.nro" "$APP/NetherSX2_nx_gl.nro"
 
@@ -66,4 +89,4 @@ echo
 echo "Done. The only file to copy:"
 ls -la "$APP/NetherSX2.nro"
 echo
-echo "SD layout:  sdmc:/switch/NetherSX2.nro  +  /switch/nethersx2/{bios,resources,games}/"
+echo "SD layout: sdmc:/switch/NetherSX2.nro + sdmc:/switch/nethersx2/"

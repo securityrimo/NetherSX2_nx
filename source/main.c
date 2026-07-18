@@ -1,24 +1,15 @@
 /* main.c
  *
- * NetherSX2 (AetherSX2 / PCSX2-lineage PS2 emulator, Android arm64) on the
- * Nintendo Switch. We load libemucore.so with the so_util ELF loader and drive
- * its NativeLibrary JNI entry points directly from C against a fake JNI env,
- * replacing the Java frontend.
- *
- * Startup mirrors EmulationActivity.onCreate -> startEmulationThread (see the
- * reconstructed call order): JNI_OnLoad, initialize(ctx,dataDir,dev,cacheDir),
- * setInputDevices, then a dedicated thread runs the BLOCKING runVMThread(ctx,
- * bootPath, null) -- which boots the ISO and then waits for a window -- while
- * this thread delivers the window via changeSurface(fakeSurface,w,h,hz) +
- * applySettings(). Input is pumped from the main thread.
- *
  * This software may be modified and distributed under the terms
  * of the MIT license.  See the LICENSE file for details.
  */
 
 #include <math.h>
+#include <errno.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -36,6 +27,7 @@
 #include "pthr.h"
 #include "keycodes.h"
 #include "syslang.h"
+#include "SwitchStorageBridge.h"
 
 // Android MotionEvent axis codes (handleControllerAxisEvent expects these)
 #define AAXIS_X         0
@@ -124,6 +116,9 @@ static void check_syscalls(void) {
     fatal_error("svcSetProcessMemoryPermission is unavailable.");
   if (envGetOwnProcessHandle() == INVALID_HANDLE)
     fatal_error("Own process handle is unavailable.");
+  if (fastmem_get_mode() != FASTMEM_MODE_OFF &&
+      (!envIsSyscallHinted(0x74) || !envIsSyscallHinted(0x75)))
+    fatal_error("Fastmem requires svcMapProcessMemory and svcUnmapProcessMemory.");
 }
 
 static int path_exists(const char *p) {
@@ -175,7 +170,7 @@ static void set_screen_size(int w, int h) {
   // within it (via the ComputeDrawRectangle centring patch in hooks/patches.c).
   screen_width = panel_width;
   screen_height = panel_height;
-  debugPrintf("screen: panel/surface %dx%d\n", panel_width, panel_height);
+
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +181,7 @@ typedef unsigned char jbool;
 
 static struct {
   int  (*JNI_OnLoad)(void *vm, void *reserved);
+  void (*JNI_OnUnload)(void *vm, void *reserved);
   jbool(*initialize)(void *env, void *cls, void *ctx, void *dataDir, void *devName, void *cacheDir);
   void (*applySettings)(void *env, void *cls);
   jbool(*isBIOSAvailable)(void *env, void *cls);
@@ -194,9 +190,13 @@ static struct {
   void (*changeSurface)(void *env, void *cls, void *surface, int w, int h, float hz);
   void (*runVMThread)(void *env, void *cls, void *ctx, void *bootPath, void *saveStatePath);
   void (*stopVMThreadLoop)(void *env, void *cls, jbool wait);
-  void (*pauseVM)(void *env, void *cls, jbool pause);
+  void (*waitForSaveStateFlush)(void *env, void *cls);
   void (*resetVM)(void *env, void *cls);
   jbool(*hasValidRenderSurface)(void *env, void *cls);
+  void (*addKeyedOSDMessage)(void *env, void *cls, void *key, void *message, float duration);
+  void (*saveStateSlot)(void *env, void *cls, int slot);
+  void (*loadStateSlot)(void *env, void *cls, int slot);
+  void (*toggleLimiterMode)(void *env, void *cls, int mode);
   void (*setPadValue)(void *env, void *cls, int controller, int bind, float value);
   void (*handleControllerButtonEvent)(void *env, void *cls, int dev, int code, jbool down);
   void (*handleControllerAxisEvent)(void *env, void *cls, int dev, int axis, float value);
@@ -209,6 +209,7 @@ static struct {
 
 static void resolve_entry_points(void) {
   nl.JNI_OnLoad = (void *)so_find_addr_rx(&emu_mod, "JNI_OnLoad");
+  nl.JNI_OnUnload = (void *)so_try_find_addr_rx(&emu_mod, "JNI_OnUnload");
   RESOLVE(initialize,                  NLSYM("initialize"));
   RESOLVE(applySettings,               NLSYM("applySettings"));
   RESOLVE(isBIOSAvailable,             NLSYM("isBIOSAvailable"));
@@ -216,9 +217,13 @@ static void resolve_entry_points(void) {
   RESOLVE(changeSurface,               NLSYM("changeSurface"));
   RESOLVE(runVMThread,                 NLSYM("runVMThread"));
   RESOLVE(stopVMThreadLoop,            NLSYM("stopVMThreadLoop"));
-  RESOLVE(pauseVM,                     NLSYM("pauseVM"));
+  RESOLVE(waitForSaveStateFlush,       NLSYM("waitForSaveStateFlush"));
   RESOLVE(resetVM,                     NLSYM("resetVM"));
   RESOLVE(hasValidRenderSurface,       NLSYM("hasValidRenderSurface"));
+  RESOLVE(addKeyedOSDMessage,          NLSYM("addKeyedOSDMessage"));
+  RESOLVE(saveStateSlot,               NLSYM("saveStateSlot"));
+  RESOLVE(loadStateSlot,               NLSYM("loadStateSlot"));
+  RESOLVE(toggleLimiterMode,           NLSYM("toggleLimiterMode"));
   // setPadValue drives the emulated DualShock2 DIRECTLY (this is what AetherSX2's
   // on-screen touch controls use), bypassing InputManager's binding layer -- which
   // is empty for us: setDefaultPadSettings only writes Pad1 knobs (Type/Deadzone/
@@ -242,25 +247,12 @@ static volatile int g_vm_running = 0;
 
 static void *emu_thread_main(void *arg) {
   (void)arg;
-  // this thread runs core code -> it needs the fake stack-guard TLS before any
-  // libemucore function reads TPIDR_EL0
   pthr_ensure_fake_tls();
-  // This IS the EE/VM thread (runVMThread runs the EE+IOP+VU0 recompilers here,
-  // ~99% busy). Give it its own cpu; the MTGS/VU worker threads and audio are
-  // pinned to the other cores by pthr.c. Created via real pthread_create, so it
-  // never went through the trampoline that pins the emucore workers.
   pthr_pin_ee_core();
-  debugPrintf("emu thread: runVMThread(%s)\n", g_disc_path);
   g_vm_running = 1;
-  // From here the VM executes recompiled PS2 code; fsync a bit more often (every
-  // 16 lines vs 128) so a hang leaves a near-complete tail on disk without the
-  // per-line fsync stall. Real crashes are captured by the exception handler.
-  g_log_fsync_all = 1;
-  // saveStatePath = NULL (fresh boot of the disc)
   nl.runVMThread(fake_env, NATIVE_CLASS, FAKE_CONTEXT,
                  jni_make_string(g_disc_path), NULL);
   g_vm_running = 0;
-  debugPrintf("emu thread: runVMThread returned\n");
   return NULL;
 }
 
@@ -270,63 +262,69 @@ static pthread_t emu_thread;
 // startup sequence
 // ---------------------------------------------------------------------------
 
+#define MAX_CONTROLLERS 2
 // --- HD rumble: driven by the core's setVibratorIntensity JNI callback -------
-static HidVibrationDeviceHandle g_vib_no1[2], g_vib_hh[2];
-static int g_vib_ready = 0;
+static HidVibrationDeviceHandle g_vib_players[MAX_CONTROLLERS][2], g_vib_hh[2];
+static int g_vib_ready[MAX_CONTROLLERS], g_vib_hh_ready;
 static int g_vibration = 1;   // Wrapper/Vibration user toggle
+static int g_controller_count = 1;
 
 static void rumble_init(void) {
-  g_vib_ready = R_SUCCEEDED(hidInitializeVibrationDevices(g_vib_no1, 2, HidNpadIdType_No1,
-                    HidNpadStyleSet_NpadStandard)) &&
-                R_SUCCEEDED(hidInitializeVibrationDevices(g_vib_hh, 2, HidNpadIdType_Handheld,
-                    HidNpadStyleSet_NpadStandard));
+  static const HidNpadIdType ids[MAX_CONTROLLERS] = {
+    HidNpadIdType_No1, HidNpadIdType_No2
+  };
+  for (int player = 0; player < g_controller_count; player++)
+    g_vib_ready[player] = R_SUCCEEDED(hidInitializeVibrationDevices(
+        g_vib_players[player], 2, ids[player], HidNpadStyleSet_NpadStandard));
+  g_vib_hh_ready = R_SUCCEEDED(hidInitializeVibrationDevices(
+      g_vib_hh, 2, HidNpadIdType_Handheld, HidNpadStyleSet_NpadStandard));
 }
 
 // large = low-frequency motor, small = high-frequency motor, both 0..1. Sent to
 // both the attached-controller and handheld device sets (the inactive one is a
 // no-op). Called from jni_fake.c's setVibratorIntensity handler.
-void wrapper_rumble(float large, float small) {
-  if (!g_vib_ready || !g_vibration) return;
+void wrapper_rumble(int player, float large, float small) {
+  if (!g_vibration || player < 0 || player >= g_controller_count) return;
   if (large < 0.f) large = 0.f; else if (large > 1.f) large = 1.f;
   if (small < 0.f) small = 0.f; else if (small > 1.f) small = 1.f;
   HidVibrationValue v[2];
   v[0].amp_low = large; v[0].freq_low = 160.0f;
   v[0].amp_high = small; v[0].freq_high = 320.0f;
   v[1] = v[0];
-  hidSendVibrationValues(g_vib_no1, v, 2);
-  hidSendVibrationValues(g_vib_hh, v, 2);
+  if (g_vib_ready[player])
+    hidSendVibrationValues(g_vib_players[player], v, 2);
+  if (player == 0 && g_vib_hh_ready)
+    hidSendVibrationValues(g_vib_hh, v, 2);
 }
 
-static void *make_input_devices(void) {
-  // one InputDeviceInfo with a non-empty descriptor so the core allocates a pad,
-  // plus a single Vibrator (opaque -- the core hands it back to setVibratorIntensity)
-  // so the core knows the pad can rumble. SDK 30 -> the vibrators[] path (no manager).
-  void *dev = jni_obj_new("xyz/aethersx2/android/NativeLibrary$InputDeviceInfo");
-  jni_obj_set_string(dev, "descriptor", "Switch-Pad-0");
-  void *vibs = jni_make_object_array(1);
-  jni_obj_array_set(vibs, 0, jni_obj_new("android/os/Vibrator"));
-  jni_obj_set_object(dev, "vibratorManager", NULL);
-  jni_obj_set_object(dev, "vibrators", vibs);
-  void *arr = jni_make_object_array(1);
-  jni_obj_array_set(arr, 0, dev);
+static void *make_input_devices(int count) {
+  void *arr = jni_make_object_array(count);
+  for (int player = 0; player < count; player++) {
+    char descriptor[32];
+    snprintf(descriptor, sizeof(descriptor), "Switch-Pad-%d", player);
+    void *dev = jni_obj_new("xyz/aethersx2/android/NativeLibrary$InputDeviceInfo");
+    jni_obj_set_string(dev, "descriptor", descriptor);
+    void *vibs = jni_make_object_array(1);
+    void *vibrator = jni_obj_new("android/os/Vibrator");
+    jni_obj_set_int(vibrator, "player", player);
+    jni_obj_array_set(vibs, 0, vibrator);
+    jni_obj_set_object(dev, "vibratorManager", NULL);
+    jni_obj_set_object(dev, "vibrators", vibs);
+    jni_obj_array_set(arr, player, dev);
+  }
   return arr;
 }
 
 extern volatile int g_net_ready;  // imports.c -- gates the DEV9 socket shims
 
-// PS2 network adapter (DEV9, "Sockets" backend). Opt-in via the launcher's
-// Network toggle; off by default. The libnx bsd service is brought up only when
-// the user enabled it (it reserves a transfer buffer we don't want to pay for
-// otherwise); once it is up g_net_ready lets the socket shims through. The DEV9
-// keys are always written -- EthEnable=false when off so a stray ini line can't
-// silently turn the adapter on.
+// Initialize the DEV9 socket backend only when enabled.
 static void apply_network_settings(void) {
   int on = prefs_get_bool("Wrapper/Network", false);
   if (on && !g_net_ready) {
     if (R_SUCCEEDED(socketInitializeDefault())) {
       g_net_ready = 1;
     } else {
-      debugPrintf("net: socketInitializeDefault failed; adapter disabled\n");
+
       on = 0;
     }
   }
@@ -337,8 +335,6 @@ static void apply_network_settings(void) {
   prefs_set_string("DEV9/Eth/ModeDNS1",      "Auto");
   prefs_set_string("DEV9/Eth/ModeDNS2",      "Auto");
   prefs_set_string("DEV9/Hdd/HddEnable",     "false");
-  // Optional custom DNS (e.g. a community revival server); blank => Auto. Manual
-  // mode makes the core's internal resolver forward lookups to this address.
   const char *dns = prefs_get_string("Wrapper/NetDNS", "");
   if (on && dns && dns[0]) {
     prefs_set_string("DEV9/Eth/ModeDNS1", "Manual");
@@ -347,20 +343,11 @@ static void apply_network_settings(void) {
 }
 
 static void run_startup_sequence(void) {
-  debugPrintf("JNI_OnLoad\n");
   nl.JNI_OnLoad(fake_vm, NULL);
 
-  // Fastmem stays OFF: proven infeasible on Horizon (2026-07-10). Fastmem needs
-  // the PS2 RAM both ALIASED into a 4 GB window AND per-page mprotect-able (for
-  // self-modifying-code detection); no Horizon primitive gives both -- shared
-  // memory aliases but can't be mprotect'd (0xd401), svcMapProcessMemory can
-  // mprotect but won't alias any source (0xd401). The software VTLB is slower per
-  // access but fully correct.
-  prefs_set_bool("EmuCore/CPU/Recompiler/EnableFastmem", false);
+  prefs_set_bool("EmuCore/CPU/Recompiler/EnableFastmem",
+                 fastmem_get_mode() != FASTMEM_MODE_OFF);
 
-  // initialize(ctx, dataDir, cacheDir, deviceName): the 2nd string is the cache
-  // dir (the core set EmuFolders::Cache from it), the 3rd is the device name.
-  debugPrintf("initialize\n");
   jbool ok = nl.initialize(fake_env, NATIVE_CLASS, FAKE_CONTEXT,
                            jni_make_string(DATA_ROOT),
                            jni_make_string(CACHE_DIR),
@@ -372,13 +359,8 @@ static void run_startup_sequence(void) {
   // wrote during initialize.
   prefs_set_int("EmuCore/GS/Renderer", GS_RENDERER);
   prefs_set_string("EmuCore/DiscPath", g_disc_path);
-  // Fast boot skips the BIOS OSDSYS and launches the disc ELF directly. Launcher
-  // toggle (default on); off runs the full BIOS boot, which auto-runs the disc but
-  // is slower. Some titles need one or the other, so it is user-selectable.
   prefs_set_string("EmuCore/EnableFastBoot",
                    prefs_get_bool("Wrapper/FastBoot", true) ? "1" : "0");
-  // fastCDVD off: it collapses CDVD command timing ("may break games") and can hang
-  // the boot in sceCdInit's SIF-RPC bind; disc reads work without it.
   prefs_set_bool("EmuCore/Speedhacks/fastCDVD", false);
   // AspectRatio is a PCSX2 enum NAME; repair an invalid value, else respect the
   // user's. The core reads this pref directly to aspect-fit + centre the display.
@@ -397,8 +379,6 @@ static void run_startup_sequence(void) {
   prefs_set_int("EmuCore/GS/CropRight", 0);
   prefs_set_int("EmuCore/GS/CropBottom", 0);
   prefs_set_int("EmuCore/GS/StretchY", 100);
-  // PS2 network adapter: bring up sockets (if enabled) and seed the DEV9 keys
-  // before the VM thread boots and initialises DEV9.
   apply_network_settings();
   // Core logging off: the EE/IOP console formats a lot of strings per frame.
   prefs_set_string("Logging/EnableSystemConsole", "0");
@@ -416,45 +396,41 @@ static void run_startup_sequence(void) {
   // come up localised instead of always English.
   apply_system_language();
 
-  // ORDER MATTERS. setDefaultPadSettings generates the default bindings FOR THE
-  // REGISTERED INPUT DEVICES: it clears InputSources + Pad1..Pad8 and rebinds. Run
-  // before setInputDevices it binds to an empty device list, so Pad1 ends up with NO
-  // bindings and the controller does nothing in-game. Register the device first, then
-  // generate defaults, then apply.
-  debugPrintf("setInputDevices\n");
-  nl.setInputDevices(fake_env, NATIVE_CLASS, make_input_devices());
+  // Default bindings must be generated after registering input devices.
+  nl.setInputDevices(fake_env, NATIVE_CLASS, make_input_devices(g_controller_count));
 
   if (nl.setDefaultPadSettings)
     nl.setDefaultPadSettings(fake_env, NATIVE_CLASS);
 
-  // Rumble is dispatched by AndroidInputSource::UpdateMotorState only when Pad1's
-  // motor outputs are bound to a vibration target ("<device>/Vibrator<N>"). We drive
-  // the pad via setPadValue, so setDefaultPadSettings leaves the motors unbound; bind
-  // them to our device (named by the descriptor from make_input_devices).
-  prefs_set_string("Pad1/LargeMotor", "Switch-Pad-0/Vibrator0");
-  prefs_set_string("Pad1/SmallMotor", "Switch-Pad-0/Vibrator0");
-  prefs_set_string("Pad1/LargeMotorScale", "1.0");
-  prefs_set_string("Pad1/SmallMotorScale", "1.0");
+  for (int player = 0; player < MAX_CONTROLLERS; player++) {
+    char key[32];
+    snprintf(key, sizeof(key), "Pad%d/Type", player + 1);
+    prefs_set_string(key, player < g_controller_count ? "DualShock2" : "None");
+  }
 
-  debugPrintf("applySettings\n");
+  for (int player = 0; player < g_controller_count; player++) {
+    char key[40], value[40];
+    snprintf(value, sizeof(value), "Switch-Pad-%d/Vibrator0", player);
+    snprintf(key, sizeof(key), "Pad%d/LargeMotor", player + 1);
+    prefs_set_string(key, value);
+    snprintf(key, sizeof(key), "Pad%d/SmallMotor", player + 1);
+    prefs_set_string(key, value);
+    snprintf(key, sizeof(key), "Pad%d/LargeMotorScale", player + 1);
+    prefs_set_string(key, "1.0");
+    snprintf(key, sizeof(key), "Pad%d/SmallMotorScale", player + 1);
+    prefs_set_string(key, "1.0");
+  }
+
   nl.applySettings(fake_env, NATIVE_CLASS);
 
-  // spawn the VM thread; it boots the disc then blocks waiting for the window
-  debugPrintf("spawn emu thread\n");
   pthread_create(&emu_thread, NULL, emu_thread_main, NULL);
 
-  // give runVMThread a moment to reach its "waiting for window" point, then
-  // hand it the render surface (this unblocks the GS thread's GL bring-up)
-  svcSleepThread(250000000ull); // 250 ms
-  debugPrintf("changeSurface %dx%d\n", screen_width, screen_height);
+  svcSleepThread(250000000ull);
   nl.changeSurface(fake_env, NATIVE_CLASS, FAKE_SURFACE,
                    screen_width, screen_height, 60.0f);
   nl.applySettings(fake_env, NATIVE_CLASS);
 
-  // the surface bring-up above ran on THIS thread; if it touched GL, hand the
-  // single context back so the GS thread can own it
   egl_gl_ownership_release();
-  debugPrintf("startup sequence complete\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -485,8 +461,8 @@ static const PadMap pad_map[] = {
   { HidNpadButton_Right,  AKEYCODE_DPAD_RIGHT },
 };
 
-static PadState pad;
-static u64 pad_prev = 0;
+static PadState g_pads[MAX_CONTROLLERS];
+static u64 g_pad_previous[MAX_CONTROLLERS];
 
 // PS2 DualShock2 bind indices, recovered from libemucore.so's InputBindingInfo
 // array (0x75d88, stride 0x30). This is the `bind` argument of setPadValue().
@@ -534,13 +510,15 @@ static const struct { const char *key; int bind; const char *def; } ps2_buttons[
 };
 #define NUM_PS2_BUTTONS (sizeof(ps2_buttons) / sizeof(*ps2_buttons))
 
-// runtime binding table + stick config, populated by pad_load_bindings().
-static struct { u64 hid; int bind; } pad_binds[NUM_PS2_BUTTONS];
-static int pad_binds_count = 0;
 typedef struct { int src; int invX, invY; } PadStick; // src: 0=LStick 1=RStick -1=none
-static PadStick stick_l = { 0, 0, 0 };
-static PadStick stick_r = { 1, 0, 0 };
-static float stick_deadzone = 0.f; // radial deadzone 0..1 (Wrapper/Pad1/Deadzone %)
+typedef struct {
+  struct { u64 hid; int bind; } binds[NUM_PS2_BUTTONS];
+  int bind_count;
+  PadStick left_stick;
+  PadStick right_stick;
+  float deadzone;
+} PadConfig;
+static PadConfig g_pad_config[MAX_CONTROLLERS];
 
 static u64 tok_to_hid(const char *tok) {
   if (!tok || !*tok || !strcasecmp(tok, "None")) return 0;
@@ -555,97 +533,501 @@ static int stick_src_from_tok(const char *tok) {
   return -1; // None / unknown
 }
 
-// Read the Wrapper/Pad1/* bindings from prefs into pad_binds + stick_l/r.
-// Called once after prefs_init; defaults reproduce the classic layout so an
-// unconfigured install behaves exactly as before.
-static void pad_load_bindings(void) {
-  pad_binds_count = 0;
-  for (unsigned i = 0; i < NUM_PS2_BUTTONS; i++) {
-    char key[64];
-    snprintf(key, sizeof(key), "Wrapper/Pad1/%s", ps2_buttons[i].key);
-    const u64 hid = tok_to_hid(prefs_get_string(key, ps2_buttons[i].def));
-    if (hid) {
-      pad_binds[pad_binds_count].hid = hid;
-      pad_binds[pad_binds_count].bind = ps2_buttons[i].bind;
-      pad_binds_count++;
-    }
+static const char *pad_pref_string(int player, const char *name, const char *def) {
+  char key[64];
+  snprintf(key, sizeof(key), "Wrapper/Pad%d/%s", player + 1, name);
+  if (player > 0 && !prefs_contains(key)) {
+    snprintf(key, sizeof(key), "Wrapper/Pad1/%s", name);
   }
-  stick_l.src  = stick_src_from_tok(prefs_get_string("Wrapper/Pad1/LeftStick", "LStick"));
-  stick_l.invX = prefs_get_bool("Wrapper/Pad1/LeftStickInvertX", false);
-  stick_l.invY = prefs_get_bool("Wrapper/Pad1/LeftStickInvertY", false);
-  stick_r.src  = stick_src_from_tok(prefs_get_string("Wrapper/Pad1/RightStick", "RStick"));
-  stick_r.invX = prefs_get_bool("Wrapper/Pad1/RightStickInvertX", false);
-  stick_r.invY = prefs_get_bool("Wrapper/Pad1/RightStickInvertY", false);
-  { int dz = prefs_get_int("Wrapper/Pad1/Deadzone", 0); if (dz < 0) dz = 0; if (dz > 90) dz = 90;
-    stick_deadzone = (float)dz / 100.0f; }
+  return prefs_get_string(key, def);
+}
+
+static bool pad_pref_bool(int player, const char *name, bool def) {
+  char key[64];
+  snprintf(key, sizeof(key), "Wrapper/Pad%d/%s", player + 1, name);
+  if (player > 0 && !prefs_contains(key)) {
+    snprintf(key, sizeof(key), "Wrapper/Pad1/%s", name);
+  }
+  return prefs_get_bool(key, def);
+}
+
+static int pad_pref_int(int player, const char *name, int def) {
+  char key[64];
+  snprintf(key, sizeof(key), "Wrapper/Pad%d/%s", player + 1, name);
+  if (player > 0 && !prefs_contains(key)) {
+    snprintf(key, sizeof(key), "Wrapper/Pad1/%s", name);
+  }
+  return prefs_get_int(key, def);
+}
+
+static void pad_load_bindings(void) {
+  g_controller_count = prefs_get_int("Wrapper/ControllerCount", 1);
+  if (g_controller_count < 1) g_controller_count = 1;
+  if (g_controller_count > MAX_CONTROLLERS) g_controller_count = MAX_CONTROLLERS;
+  memset(g_pad_config, 0, sizeof(g_pad_config));
+  for (int player = 0; player < MAX_CONTROLLERS; player++) {
+    PadConfig *config = &g_pad_config[player];
+    for (unsigned i = 0; i < NUM_PS2_BUTTONS; i++) {
+      const u64 hid = tok_to_hid(pad_pref_string(player, ps2_buttons[i].key,
+                                                  ps2_buttons[i].def));
+      if (hid) {
+        config->binds[config->bind_count].hid = hid;
+        config->binds[config->bind_count].bind = ps2_buttons[i].bind;
+        config->bind_count++;
+      }
+    }
+    config->left_stick.src = stick_src_from_tok(pad_pref_string(player, "LeftStick", "LStick"));
+    config->left_stick.invX = pad_pref_bool(player, "LeftStickInvertX", false);
+    config->left_stick.invY = pad_pref_bool(player, "LeftStickInvertY", false);
+    config->right_stick.src = stick_src_from_tok(pad_pref_string(player, "RightStick", "RStick"));
+    config->right_stick.invX = pad_pref_bool(player, "RightStickInvertX", false);
+    config->right_stick.invY = pad_pref_bool(player, "RightStickInvertY", false);
+    int deadzone = pad_pref_int(player, "Deadzone", 10);
+    if (deadzone < 0) deadzone = 0;
+    if (deadzone > 90) deadzone = 90;
+    config->deadzone = (float)deadzone / 100.0f;
+  }
   g_vibration = prefs_get_bool("Wrapper/Vibration", true);
-  debugPrintf("pad: %d button bindings loaded; sticks L=%d(inv %d,%d) R=%d(inv %d,%d)\n",
-              pad_binds_count, stick_l.src, stick_l.invX, stick_l.invY,
-              stick_r.src, stick_r.invX, stick_r.invY);
 }
 
-// PCSX2 models each analog stick as four HALF-axis binds, so a stick axis is
-// split into its two directions (only one is ever non-zero).
-static void pad_axis(int neg_bind, int pos_bind, float v) {
-  nl.setPadValue(fake_env, NATIVE_CLASS, 0, pos_bind, v > 0.f ? v : 0.f);
-  nl.setPadValue(fake_env, NATIVE_CLASS, 0, neg_bind, v < 0.f ? -v : 0.f);
+static void pad_axis(int controller, int neg_bind, int pos_bind, float v) {
+  nl.setPadValue(fake_env, NATIVE_CLASS, controller, pos_bind, v > 0.f ? v : 0.f);
+  nl.setPadValue(fake_env, NATIVE_CLASS, controller, neg_bind, v < 0.f ? -v : 0.f);
 }
 
-// Feed one PS2 analog stick from a configured physical Switch stick. The
-// baseline (src=matching stick, no invert) reproduces the old fixed mapping:
-// x right-positive -> pos_x bind, y up-positive -> pos_y bind.
-static void apply_ps2_stick(const PadStick *c, HidAnalogStickState ls, HidAnalogStickState rs,
+static void apply_ps2_stick(int controller, const PadConfig *config, const PadStick *c,
+                            HidAnalogStickState ls, HidAnalogStickState rs,
                             int negX, int posX, int negY, int posY) {
-  if (c->src < 0) { pad_axis(negX, posX, 0.f); pad_axis(negY, posY, 0.f); return; }
+  if (c->src < 0) {
+    pad_axis(controller, negX, posX, 0.f);
+    pad_axis(controller, negY, posY, 0.f);
+    return;
+  }
   const HidAnalogStickState s = (c->src == 0) ? ls : rs;
   const float scale = 1.f / 32767.0f;
   float x = (float)s.x * scale, y = (float)s.y * scale;
-  if (stick_deadzone > 0.f) { // radial deadzone, rescaled so the edge maps to 0
+  if (config->deadzone > 0.f) {
     float mag = sqrtf(x * x + y * y);
-    if (mag <= stick_deadzone) { x = 0.f; y = 0.f; }
-    else { float k = (mag - stick_deadzone) / ((1.f - stick_deadzone) * mag); x *= k; y *= k; }
+    if (mag <= config->deadzone) { x = 0.f; y = 0.f; }
+    else { float k = (mag - config->deadzone) / ((1.f - config->deadzone) * mag); x *= k; y *= k; }
   }
   if (c->invX) x = -x;
   if (c->invY) y = -y;
-  pad_axis(negX, posX, x);
-  pad_axis(negY, posY, y);
+  pad_axis(controller, negX, posX, x);
+  pad_axis(controller, negY, posY, y);
 }
 
-static void update_gamepad(void) {
-  padUpdate(&pad);
-  const u64 down = padGetButtons(&pad);
-  const u64 changed = down ^ pad_prev;
+typedef enum {
+  QUICK_MENU_CLOSED,
+  QUICK_MENU_MAIN,
+  QUICK_MENU_MAPPING,
+  QUICK_MENU_CAPTURE
+} QuickMenuMode;
 
-  if (nl.setPadValue) {
-    // Drive the DualShock2 directly -- no InputManager bindings involved.
-    // pad_binds[] + stick_l/r come from Wrapper/Pad1/* via pad_load_bindings().
-    for (int i = 0; i < pad_binds_count; i++) {
-      if (!(changed & pad_binds[i].hid)) continue;
-      const int pressed = (down & pad_binds[i].hid) ? 1 : 0;
-      nl.setPadValue(fake_env, NATIVE_CLASS, 0, pad_binds[i].bind, pressed ? 1.0f : 0.0f);
-    }
-    const HidAnalogStickState ls = padGetStickPos(&pad, 0);
-    const HidAnalogStickState rs = padGetStickPos(&pad, 1);
-    apply_ps2_stick(&stick_l, ls, rs, PB_LLEFT, PB_LRIGHT, PB_LDOWN, PB_LUP);
-    apply_ps2_stick(&stick_r, ls, rs, PB_RLEFT, PB_RRIGHT, PB_RDOWN, PB_RUP);
-  } else {
-    // Fallback: the Android keycode path (needs InputManager bindings to exist).
-    for (unsigned i = 0; i < sizeof(pad_map) / sizeof(*pad_map); i++) {
-      if (changed & pad_map[i].hid)
-        nl.handleControllerButtonEvent(fake_env, NATIVE_CLASS, 0, pad_map[i].keycode,
-                                       (down & pad_map[i].hid) ? 1 : 0);
-    }
-    const float scale = 1.f / 32767.0f;
-    const HidAnalogStickState ls = padGetStickPos(&pad, 0);
-    const HidAnalogStickState rs = padGetStickPos(&pad, 1);
-    nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, 0, AAXIS_X,  (float)ls.x *  scale);
-    nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, 0, AAXIS_Y,  (float)ls.y * -scale);
-    nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, 0, AAXIS_Z,  (float)rs.x *  scale);
-    nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, 0, AAXIS_RZ, (float)rs.y * -scale);
-    nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, 0, AAXIS_LTRIGGER, (down & HidNpadButton_ZL) ? 1.f : 0.f);
-    nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, 0, AAXIS_RTRIGGER, (down & HidNpadButton_ZR) ? 1.f : 0.f);
+static QuickMenuMode g_quick_menu_mode;
+static int g_quick_menu_selection;
+static int g_quick_menu_slot;
+static int g_quick_menu_map_player;
+static int g_quick_menu_map_selection;
+static int g_quick_menu_capture_armed;
+static int g_quick_menu_exit_requested;
+static int g_quick_menu_limiter_unlimited;
+static int g_quick_menu_ee_cycle_rate;
+static int g_quick_menu_ee_cycle_skip;
+static int g_quick_menu_restore_messages;
+static int g_quick_menu_ready;
+
+static const char *const g_ee_cycle_rate_labels[] = {
+  "50%", "60%", "75%", "100%", "130%", "180%", "300%"
+};
+
+static const char *const g_ee_cycle_skip_labels[] = {
+  "Off", "Mild", "Moderate", "Maximum"
+};
+
+static void text_append(char *buffer, size_t size, const char *format, ...) {
+  size_t used = strlen(buffer);
+  if (used >= size - 1) return;
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer + used, size - used, format, args);
+  va_end(args);
+}
+
+static void quick_menu_message(const char *key, const char *message, float duration) {
+  nl.addKeyedOSDMessage(fake_env, NATIVE_CLASS, jni_make_string(key),
+                        jni_make_string(message), duration);
+}
+
+static void quick_menu_status(const char *message) {
+  quick_menu_message("nethersx2_quick_status", message, 3.0f);
+}
+
+static void quick_menu_release_inputs(void) {
+  if (!nl.setPadValue) return;
+  for (int player = 0; player < g_controller_count; player++) {
+    PadConfig *config = &g_pad_config[player];
+    for (int i = 0; i < config->bind_count; i++)
+      nl.setPadValue(fake_env, NATIVE_CLASS, player, config->binds[i].bind, 0.0f);
+    pad_axis(player, PB_LLEFT, PB_LRIGHT, 0.0f);
+    pad_axis(player, PB_LDOWN, PB_LUP, 0.0f);
+    pad_axis(player, PB_RLEFT, PB_RRIGHT, 0.0f);
+    pad_axis(player, PB_RDOWN, PB_RUP, 0.0f);
   }
-  pad_prev = down;
+}
+
+static void quick_menu_draw_main(void) {
+  static const char *labels[] = {
+    "Resume game", "State slot", "Load state", "Save state",
+    "Controller mapping", "Frame limiter", "EE cycle rate", "EE cycle skip",
+    "Reset console", "Exit game"
+  };
+  char text[1024] = "NETHERSX2 QUICK MENU\n\n";
+  for (int i = 0; i < (int)(sizeof(labels) / sizeof(*labels)); i++) {
+    const char *marker = i == g_quick_menu_selection ? "> " : "  ";
+    if (i == 1)
+      text_append(text, sizeof(text), "%s%s: %d\n", marker, labels[i], g_quick_menu_slot);
+    else if (i == 5)
+      text_append(text, sizeof(text), "%s%s: %s\n", marker, labels[i],
+                  g_quick_menu_limiter_unlimited ? "Unlimited" : "Limited");
+    else if (i == 6)
+      text_append(text, sizeof(text), "%s%s: %s\n", marker, labels[i],
+                  g_ee_cycle_rate_labels[g_quick_menu_ee_cycle_rate + 3]);
+    else if (i == 7)
+      text_append(text, sizeof(text), "%s%s: %s\n", marker, labels[i],
+                  g_ee_cycle_skip_labels[g_quick_menu_ee_cycle_skip]);
+    else
+      text_append(text, sizeof(text), "%s%s\n", marker, labels[i]);
+  }
+  text_append(text, sizeof(text), "\nA  Select     B  Close     Left/Right  Change");
+  quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
+}
+
+static void quick_menu_draw_mapping(void) {
+  const int item_count = (int)NUM_PS2_BUTTONS + 2;
+  const int first = g_quick_menu_map_selection > 3 ? g_quick_menu_map_selection - 3 : 0;
+  int last = first + 7;
+  if (last > item_count) last = item_count;
+  char text[1024] = "CONTROLLER MAPPING\n\n";
+  for (int item = first; item < last; item++) {
+    const char *marker = item == g_quick_menu_map_selection ? "> " : "  ";
+    if (item == 0) {
+      text_append(text, sizeof(text), "%sPlayer: %d\n", marker, g_quick_menu_map_player + 1);
+    } else if (item <= (int)NUM_PS2_BUTTONS) {
+      const unsigned bind = (unsigned)(item - 1);
+      text_append(text, sizeof(text), "%s%s: %s\n", marker, ps2_buttons[bind].key,
+                  pad_pref_string(g_quick_menu_map_player, ps2_buttons[bind].key,
+                                  ps2_buttons[bind].def));
+    } else {
+      text_append(text, sizeof(text), "%sBack\n", marker);
+    }
+  }
+  text_append(text, sizeof(text), "\nA  Rebind     Y  Clear     B  Back");
+  quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
+}
+
+static void quick_menu_draw_capture(void) {
+  const unsigned bind = (unsigned)(g_quick_menu_map_selection - 1);
+  char text[512];
+  snprintf(text, sizeof(text),
+           "CONTROLLER MAPPING\n\nPlayer %d - %s\n\nRelease all buttons, then press the new button.\nL + R + Plus cancels.",
+           g_quick_menu_map_player + 1, ps2_buttons[bind].key);
+  quick_menu_message("nethersx2_quick_menu", text, 3600.0f);
+}
+
+static void quick_menu_close(void) {
+  quick_menu_message("nethersx2_quick_menu", "", 0.01f);
+  g_quick_menu_mode = QUICK_MENU_CLOSED;
+  if (g_quick_menu_restore_messages) {
+    prefs_set_bool("EmuCore/GS/OsdShowMessages", false);
+    prefs_save();
+    nl.applySettings(fake_env, NATIVE_CLASS);
+    g_quick_menu_restore_messages = 0;
+  }
+}
+
+static void quick_menu_open(void) {
+  quick_menu_release_inputs();
+  g_quick_menu_mode = QUICK_MENU_MAIN;
+  g_quick_menu_selection = 0;
+  g_quick_menu_limiter_unlimited = !prefs_get_bool("EmuCore/GS/FrameLimitEnable", true);
+  g_quick_menu_ee_cycle_rate = prefs_get_int("EmuCore/Speedhacks/EECycleRate", 0);
+  if (g_quick_menu_ee_cycle_rate < -3) g_quick_menu_ee_cycle_rate = -3;
+  if (g_quick_menu_ee_cycle_rate > 3) g_quick_menu_ee_cycle_rate = 3;
+  g_quick_menu_ee_cycle_skip = prefs_get_int("EmuCore/Speedhacks/EECycleSkip", 0);
+  if (g_quick_menu_ee_cycle_skip < 0) g_quick_menu_ee_cycle_skip = 0;
+  if (g_quick_menu_ee_cycle_skip > 3) g_quick_menu_ee_cycle_skip = 3;
+  if (!prefs_get_bool("EmuCore/GS/OsdShowMessages", true)) {
+    g_quick_menu_restore_messages = 1;
+    prefs_set_bool("EmuCore/GS/OsdShowMessages", true);
+    nl.applySettings(fake_env, NATIVE_CLASS);
+  }
+  quick_menu_draw_main();
+}
+
+static const char *quick_menu_pressed_token(u64 pressed) {
+  for (unsigned i = 0; i < sizeof(hid_tokens) / sizeof(*hid_tokens); i++)
+    if (pressed & hid_tokens[i].hid) return hid_tokens[i].tok;
+  return NULL;
+}
+
+static bool quick_menu_persist_launcher_setting(const char *key, const char *value) {
+  const char *path = DATA_ROOT "/launcher.ini";
+  const char *tmp = DATA_ROOT "/launcher.ini.tmp";
+  const char *old = DATA_ROOT "/launcher.ini.old";
+  remove(tmp);
+  struct stat st;
+  if (stat(path, &st) != 0 && stat(old, &st) == 0)
+    rename(old, path);
+  else
+    remove(old);
+
+  FILE *input = fopen(path, "r");
+  FILE *output = fopen(tmp, "w");
+  if (!output) {
+    if (input) fclose(input);
+    return false;
+  }
+  bool replaced = false;
+  char line[2048];
+  while (input && fgets(line, sizeof(line), input)) {
+    char *start = line;
+    while (*start && isspace((unsigned char)*start)) start++;
+    char *equals = strchr(start, '=');
+    char *end = equals;
+    while (end && end > start && isspace((unsigned char)end[-1])) end--;
+    if (equals && (size_t)(end - start) == strlen(key) &&
+        !memcmp(start, key, strlen(key))) {
+      fprintf(output, "%s = %s\n", key, value);
+      replaced = true;
+    } else {
+      fputs(line, output);
+    }
+  }
+  if (input) fclose(input);
+  if (!replaced) fprintf(output, "%s = %s\n", key, value);
+  bool ok = fflush(output) == 0 && fsync(fileno(output)) == 0;
+  if (fclose(output) != 0) ok = false;
+  if (!ok) {
+    remove(tmp);
+    return false;
+  }
+  if (rename(path, old) != 0 && errno != ENOENT) {
+    remove(tmp);
+    return false;
+  }
+  if (rename(tmp, path) != 0) {
+    rename(old, path);
+    return false;
+  }
+  fsdevCommitDevice("sdmc");
+  remove(old);
+  fsdevCommitDevice("sdmc");
+  return true;
+}
+
+static bool quick_menu_store_binding(const char *token) {
+  const unsigned bind = (unsigned)(g_quick_menu_map_selection - 1);
+  char key[64];
+  snprintf(key, sizeof(key), "Wrapper/Pad%d/%s", g_quick_menu_map_player + 1,
+           ps2_buttons[bind].key);
+  prefs_set_string(key, token);
+  if (g_quick_menu_restore_messages)
+    prefs_set_bool("EmuCore/GS/OsdShowMessages", false);
+  prefs_save();
+  if (g_quick_menu_restore_messages)
+    prefs_set_bool("EmuCore/GS/OsdShowMessages", true);
+  pad_load_bindings();
+  return quick_menu_persist_launcher_setting(key, token);
+}
+
+static bool quick_menu_update(u64 down, u64 pressed) {
+  const bool chord = (pressed & HidNpadButton_Plus) &&
+                     (down & HidNpadButton_L) && (down & HidNpadButton_R);
+  if (g_quick_menu_mode == QUICK_MENU_CLOSED) {
+    if (!g_quick_menu_ready || !chord) return false;
+    quick_menu_open();
+    return true;
+  }
+  if (chord) {
+    quick_menu_close();
+    return true;
+  }
+
+  if (g_quick_menu_mode == QUICK_MENU_CAPTURE) {
+    if (!down) {
+      g_quick_menu_capture_armed = 1;
+    } else if (g_quick_menu_capture_armed && pressed) {
+      const char *token = quick_menu_pressed_token(pressed);
+      if (token) {
+        const bool saved = quick_menu_store_binding(token);
+        g_quick_menu_mode = QUICK_MENU_MAPPING;
+        quick_menu_draw_mapping();
+        quick_menu_status(saved ? "Controller binding updated" :
+                                  "Binding updated, but launcher.ini could not be saved");
+      }
+    }
+    return true;
+  }
+  if (!pressed) return true;
+
+  if (g_quick_menu_mode == QUICK_MENU_MAIN) {
+    const int item_count = 10;
+    if (pressed & HidNpadButton_Up)
+      g_quick_menu_selection = (g_quick_menu_selection + item_count - 1) % item_count;
+    if (pressed & HidNpadButton_Down)
+      g_quick_menu_selection = (g_quick_menu_selection + 1) % item_count;
+    if (g_quick_menu_selection == 1 && (pressed & HidNpadButton_Left))
+      g_quick_menu_slot = (g_quick_menu_slot + 9) % 10;
+    if (g_quick_menu_selection == 1 && (pressed & HidNpadButton_Right))
+      g_quick_menu_slot = (g_quick_menu_slot + 1) % 10;
+    if (g_quick_menu_selection == 6 && (pressed & HidNpadButton_Left) &&
+        g_quick_menu_ee_cycle_rate > -3) {
+      g_quick_menu_ee_cycle_rate--;
+      prefs_set_int("EmuCore/Speedhacks/EECycleRate", g_quick_menu_ee_cycle_rate);
+      nl.applySettings(fake_env, NATIVE_CLASS);
+    }
+    if (g_quick_menu_selection == 6 && (pressed & HidNpadButton_Right) &&
+        g_quick_menu_ee_cycle_rate < 3) {
+      g_quick_menu_ee_cycle_rate++;
+      prefs_set_int("EmuCore/Speedhacks/EECycleRate", g_quick_menu_ee_cycle_rate);
+      nl.applySettings(fake_env, NATIVE_CLASS);
+    }
+    if (g_quick_menu_selection == 7 && (pressed & HidNpadButton_Left) &&
+        g_quick_menu_ee_cycle_skip > 0) {
+      g_quick_menu_ee_cycle_skip--;
+      prefs_set_int("EmuCore/Speedhacks/EECycleSkip", g_quick_menu_ee_cycle_skip);
+      nl.applySettings(fake_env, NATIVE_CLASS);
+    }
+    if (g_quick_menu_selection == 7 && (pressed & HidNpadButton_Right) &&
+        g_quick_menu_ee_cycle_skip < 3) {
+      g_quick_menu_ee_cycle_skip++;
+      prefs_set_int("EmuCore/Speedhacks/EECycleSkip", g_quick_menu_ee_cycle_skip);
+      nl.applySettings(fake_env, NATIVE_CLASS);
+    }
+    if (pressed & HidNpadButton_B) {
+      quick_menu_close();
+      return true;
+    }
+    if (pressed & HidNpadButton_A) {
+      switch (g_quick_menu_selection) {
+        case 0: quick_menu_close(); return true;
+        case 2:
+          nl.loadStateSlot(fake_env, NATIVE_CLASS, g_quick_menu_slot);
+          quick_menu_close();
+          quick_menu_status("State loaded");
+          return true;
+        case 3:
+          nl.saveStateSlot(fake_env, NATIVE_CLASS, g_quick_menu_slot);
+          quick_menu_close();
+          quick_menu_status("State saved");
+          return true;
+        case 4:
+          g_quick_menu_mode = QUICK_MENU_MAPPING;
+          g_quick_menu_map_selection = 0;
+          quick_menu_draw_mapping();
+          return true;
+        case 5:
+          nl.toggleLimiterMode(fake_env, NATIVE_CLASS, 3);
+          g_quick_menu_limiter_unlimited = !g_quick_menu_limiter_unlimited;
+          break;
+        case 8:
+          nl.resetVM(fake_env, NATIVE_CLASS);
+          quick_menu_close();
+          quick_menu_status("Console reset");
+          return true;
+        case 9:
+          g_quick_menu_exit_requested = 1;
+          quick_menu_close();
+          return true;
+      }
+    }
+    quick_menu_draw_main();
+    return true;
+  }
+
+  const int item_count = (int)NUM_PS2_BUTTONS + 2;
+  if (pressed & HidNpadButton_Up)
+    g_quick_menu_map_selection = (g_quick_menu_map_selection + item_count - 1) % item_count;
+  if (pressed & HidNpadButton_Down)
+    g_quick_menu_map_selection = (g_quick_menu_map_selection + 1) % item_count;
+  if (g_quick_menu_map_selection == 0 &&
+      (pressed & (HidNpadButton_Left | HidNpadButton_Right | HidNpadButton_A)))
+    g_quick_menu_map_player = (g_quick_menu_map_player + 1) % g_controller_count;
+  if (pressed & HidNpadButton_B) {
+    g_quick_menu_mode = QUICK_MENU_MAIN;
+    quick_menu_draw_main();
+    return true;
+  }
+  if ((pressed & HidNpadButton_Y) && g_quick_menu_map_selection > 0 &&
+      g_quick_menu_map_selection <= (int)NUM_PS2_BUTTONS) {
+    const bool saved = quick_menu_store_binding("None");
+    quick_menu_status(saved ? "Controller binding cleared" :
+                                "Binding cleared, but launcher.ini could not be saved");
+  }
+  if (pressed & HidNpadButton_A) {
+    if (g_quick_menu_map_selection > 0 &&
+        g_quick_menu_map_selection <= (int)NUM_PS2_BUTTONS) {
+      g_quick_menu_mode = QUICK_MENU_CAPTURE;
+      g_quick_menu_capture_armed = 0;
+      quick_menu_draw_capture();
+      return true;
+    }
+    if (g_quick_menu_map_selection == item_count - 1) {
+      g_quick_menu_mode = QUICK_MENU_MAIN;
+      quick_menu_draw_main();
+      return true;
+    }
+  }
+  quick_menu_draw_mapping();
+  return true;
+}
+
+static void update_gamepads(void) {
+  for (int player = 0; player < g_controller_count; player++)
+    padUpdate(&g_pads[player]);
+  const u64 menu_down = padGetButtons(&g_pads[0]);
+  const u64 menu_pressed = menu_down & ~g_pad_previous[0];
+  if (quick_menu_update(menu_down, menu_pressed)) {
+    for (int player = 0; player < g_controller_count; player++)
+      g_pad_previous[player] = padGetButtons(&g_pads[player]);
+    return;
+  }
+  for (int player = 0; player < g_controller_count; player++) {
+    PadState *pad = &g_pads[player];
+    PadConfig *config = &g_pad_config[player];
+    const u64 down = padGetButtons(pad);
+    const u64 changed = down ^ g_pad_previous[player];
+    if (nl.setPadValue) {
+      for (int i = 0; i < config->bind_count; i++) {
+        if (!(changed & config->binds[i].hid)) continue;
+        nl.setPadValue(fake_env, NATIVE_CLASS, player, config->binds[i].bind,
+                       (down & config->binds[i].hid) ? 1.0f : 0.0f);
+      }
+      const HidAnalogStickState ls = padGetStickPos(pad, 0);
+      const HidAnalogStickState rs = padGetStickPos(pad, 1);
+      apply_ps2_stick(player, config, &config->left_stick, ls, rs,
+                      PB_LLEFT, PB_LRIGHT, PB_LDOWN, PB_LUP);
+      apply_ps2_stick(player, config, &config->right_stick, ls, rs,
+                      PB_RLEFT, PB_RRIGHT, PB_RDOWN, PB_RUP);
+    } else {
+      for (unsigned i = 0; i < sizeof(pad_map) / sizeof(*pad_map); i++) {
+        if (changed & pad_map[i].hid)
+          nl.handleControllerButtonEvent(fake_env, NATIVE_CLASS, player, pad_map[i].keycode,
+                                         (down & pad_map[i].hid) ? 1 : 0);
+      }
+      const float scale = 1.f / 32767.0f;
+      const HidAnalogStickState ls = padGetStickPos(pad, 0);
+      const HidAnalogStickState rs = padGetStickPos(pad, 1);
+      nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_X,  (float)ls.x *  scale);
+      nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_Y,  (float)ls.y * -scale);
+      nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_Z,  (float)rs.x *  scale);
+      nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_RZ, (float)rs.y * -scale);
+      nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_LTRIGGER, (down & HidNpadButton_ZL) ? 1.f : 0.f);
+      nl.handleControllerAxisEvent(fake_env, NATIVE_CLASS, player, AAXIS_RTRIGGER, (down & HidNpadButton_ZR) ? 1.f : 0.f);
+    }
+    g_pad_previous[player] = down;
+  }
 }
 
 #define MAX_TOUCHES 8
@@ -695,97 +1077,72 @@ static void update_touch(void) {
 }
 
 int main(void) {
-  debugPrintf("==== NetherSX2_nx main() entered ====\n");
-  {
-    u64 total = 0, used = 0;
-    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
-    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
-    debugPrintf("applet mode: %d, mem total %llu MB, used %llu MB\n",
-                (int)appletGetOperationMode(),
-                (unsigned long long)(total / (1024 * 1024)),
-                (unsigned long long)(used / (1024 * 1024)));
-  }
-
+  extern int crash_in_progress(void);
   cpu_boost(1);
 
   // settings store: load nethersx2.ini + seed OpenGL/folder defaults
   prefs_init(PREFS_PATH);
-  pad_load_bindings(); // controller map from Wrapper/Pad1/* (launcher-written)
-  debugPrintf("prefs initialized\n");
-  // boot disc: prefs EmuCore/DiscPath, else the default game.iso
+  fastmem_set_mode(!strcmp(prefs_get_string("Wrapper/FastmemMode", "off"), "hybrid") ?
+                       FASTMEM_MODE_ON : FASTMEM_MODE_OFF);
+  pad_load_bindings();
   snprintf(g_disc_path, sizeof(g_disc_path), "%s",
            prefs_get_string("EmuCore/DiscPath", DEFAULT_DISC_PATH));
+  char storage_error[256];
+  if (!switchStorageInitializeForPath(DATA_ROOT "/launcher.ini", g_disc_path, sizeof(g_disc_path),
+                                      storage_error, sizeof(storage_error)))
+    fatal_error("Could not mount game storage:\n%s\n\n%s", g_disc_path, storage_error);
   prefs_set_disc_path(g_disc_path);
+  if (switchStorageSocketReady())
+    g_net_ready = 1;
 
-  // core .so to load. The SDL launcher writes Wrapper/CoreSo to pick the build
-  // (4248 "Patched" vs 3668 "Classic"); default is the bundled name. patch_game()
-  // version-detects and applies the matching offset table.
   snprintf(g_core_so, sizeof(g_core_so), "%s",
            prefs_get_string("Wrapper/CoreSo", SO_NAME));
 
   check_syscalls();
   check_data(g_core_so, g_disc_path);
-  set_screen_size(0, 0);   // auto: 720p handheld / 1080p docked (see set_screen_size)
+  set_screen_size(0, 0);
 
   extern char *fake_heap_start;
   const unsigned heap_mb =
       (unsigned)(((char *)heap_so_base - fake_heap_start) / (1024 * 1024));
-  debugPrintf("heap: newlib %u MB, lib base %p, lib region %u MB\n",
-              heap_mb, heap_so_base, (unsigned)(heap_so_limit / (1024 * 1024)));
-
-  // a PS2 emulator (core + JIT caches + PS2 RAM + mesa) needs the full game
-  // memory pool; launched as an applet we only get ~0.5 GB and would OOM mid-boot
+  // Applet mode does not provide enough memory for the emulator.
   if (heap_mb < 1500)
     fatal_error("Not enough memory (%u MB).\n\n"
                 "Launch hbmenu over a game (hold R while\n"
                 "starting any installed title), then start\n"
                 "NetherSX2 from there.", heap_mb);
 
-  debugPrintf("so_load(%s)...\n", g_core_so);
   if (so_load(&emu_mod, g_core_so, heap_so_base, heap_so_limit) < 0)
     fatal_error("Could not load\n%s.", g_core_so);
-  debugPrintf("so_load ok: base=%p virtbase=%p size=%u KB\n",
-              emu_mod.load_base, emu_mod.load_virtbase,
-              (unsigned)(emu_mod.load_size / 1024));
 
   update_imports();
-  debugPrintf("so_relocate...\n");
   so_relocate(&emu_mod);
-  debugPrintf("so_resolve (%u imports, taint=1)...\n", (unsigned)dynlib_numfunctions);
   so_resolve(&emu_mod, dynlib_functions, dynlib_numfunctions, 1);
 
   patch_game();
   resolve_entry_points();
-  debugPrintf("entry points resolved (initialize=%p runVMThread=%p)\n",
-              (void *)nl.initialize, (void *)nl.runVMThread);
 
   so_finalize(&emu_mod);
   so_flush_caches(&emu_mod);
 
-  // fake TLS for THIS thread before any core code (init_array C++ ctors read
-  // the stack-guard cookie from TPIDR_EL0)
+  // Core constructors read the stack guard through TLS.
   pthr_install_fake_tls();
 
-  debugPrintf("so_execute_init_array (C++ ctors)...\n");
   so_execute_init_array(&emu_mod);
   so_free_temp(&emu_mod);
-  debugPrintf("init_array done\n");
 
   jni_init();
-  // real fake-objects for the class/context/surface the core dereferences
   NATIVE_CLASS = jni_obj_new("xyz/aethersx2/android/NativeLibrary");
   FAKE_CONTEXT = jni_obj_new("android/content/Context");
   FAKE_SURFACE = jni_obj_new("android/view/Surface");
   run_startup_sequence();
 
-  padConfigureInput(8, HidNpadStyleSet_NpadStandard);
-  padInitializeAny(&pad);
+  padConfigureInput(g_controller_count, HidNpadStyleSet_NpadStandard);
+  padInitialize(&g_pads[0], HidNpadIdType_No1, HidNpadIdType_Handheld);
+  padInitialize(&g_pads[1], HidNpadIdType_No2);
   hidInitializeTouchScreen();
   rumble_init();
 
-  // Present counter for the boot-done / CPU-boost-off trigger. GL bumps
-  // egl_swap_count (hooks/egl.c); Vulkan bumps vk_present_count (hooks/vk.c)
-  // since the VK path never calls eglSwapBuffers.
 #if GS_RENDERER == GS_RENDERER_VK
   extern volatile int vk_present_count;
 #define FRAME_COUNT vk_present_count
@@ -795,35 +1152,61 @@ int main(void) {
 #endif
   u64 ticks = 0;
   int boosting = 1;
+  int quick_menu_hint_shown = 0;
 
-  // the input pump wakes ~120x/s; keep it off the EE core so it never preempts
-  // the hot recompiler thread (it's a background-class thread once booted).
   pthr_pin_bg_core();
 
-  while (appletMainLoop()) {
+  while (appletMainLoop() && !g_quick_menu_exit_requested) {
+    if (crash_in_progress())
+      for (;;) svcSleepThread(1000000000ULL);
     ++ticks;
-    update_gamepad();
+    const int frame_count = FRAME_COUNT;
+    if (frame_count > 0)
+      g_quick_menu_ready = 1;
+    update_gamepads();
     update_touch();
     svcSleepThread(1000000000ull / 120); // ~120 Hz input polling
-    egl_gl_service_handover();
-
     if (boosting && FRAME_COUNT >= 300) {   // boot done: drop the load-time CPU boost
       cpu_boost(0);
       boosting = 0;
+    }
+    if (!quick_menu_hint_shown && FRAME_COUNT >= 300) {
+      quick_menu_status("Quick menu: L + R + Plus");
+      quick_menu_hint_shown = 1;
     }
 
     if (!g_vm_running && ticks > 240)       // VM thread exited -> shut down
       break;
   }
 
-  // Allow RequestStop to actually stop now: our reqstop_hook (hooks/patches.c)
-  // ignores the core's spurious boot-time stop, so the intentional shutdown must
-  // re-enable it or stopVMThreadLoop would be swallowed and the join would hang.
+  if (g_quick_menu_mode != QUICK_MENU_CLOSED)
+    quick_menu_close();
+
+  const int has_next_load = envHasNextLoad();
+  const char *launcher_path = prefs_get_string("Wrapper/LauncherPath", "");
+  if (g_quick_menu_exit_requested && has_next_load) {
+    if (launcher_path[0])
+      envSetNextLoad(launcher_path, launcher_path);
+  }
+
+  // The boot-time stop filter must be disabled during shutdown.
   { extern volatile int g_allow_stop; g_allow_stop = 1; }
   nl.stopVMThreadLoop(fake_env, NATIVE_CLASS, 1);
   pthread_join(emu_thread, NULL);
+  nl.waitForSaveStateFlush(fake_env, NATIVE_CLASS);
+  if (nl.JNI_OnUnload)
+    nl.JNI_OnUnload(fake_vm, NULL);
+  core_shutdown_mtgs();
+  libc_finalize_core();
+  pthr_shutdown();
+  libc_memory_shutdown();
+  so_unload(&emu_mod);
   prefs_save();
-
+  const bool storage_socket = switchStorageSocketReady();
+  switchStorageShutdown();
+  if (g_net_ready && !storage_socket)
+    socketExit();
+  g_net_ready = 0;
   extern void NX_NORETURN __libnx_exit(int rc);
   __libnx_exit(0);
   return 0;

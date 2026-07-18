@@ -44,7 +44,7 @@ vkCreateAndroidSurfaceKHR_shim(VkInstance inst,
       .window = (void *)ci->window, // NWindow* -- no conversion
   };
   VkResult r = vkCreateViSurfaceNN(inst, &vi, alloc, out);
-  debugPrintf("vk: CreateAndroidSurfaceKHR -> ViSurfaceNN rc=%d\n", (int)r);
+
   return r;
 }
 
@@ -147,7 +147,7 @@ vkCreateInstance_hook(const VkInstanceCreateInfo *ci,
   m.ppEnabledExtensionNames = ext;
   VkResult r = vkCreateInstance(&m, alloc, out);
   free((void *)ext);
-  debugPrintf("vk: CreateInstance (%u exts) rc=%d\n", n, (int)r);
+
   return r;
 }
 

@@ -60,6 +60,7 @@ uintptr_t so_find_addr_rx(so_module *mod, const char *symbol);
 uintptr_t so_try_find_addr_rx(so_module *mod, const char *symbol);
 DynLibFunction *so_find_import(DynLibFunction *funcs, int num_funcs, const char *name);
 void so_finalize(so_module *mod);
+uint32_t so_unload(so_module *mod);
 
 // dl_iterate_phdr() replacement operating on all loaded modules;
 // required by the libunwind embedded in libc++_shared.so

@@ -16,6 +16,11 @@ and each build's data files, and extracts the ones you pick to the SD card at
 launch. An SDL cover-art launcher chooses the game, the renderer, and per-game
 settings, then chainloads the emulator.
 
+The launcher supports multiple library folders across SD, USB mass storage, and SMB shares.
+
+**L + R + Plus** to open the quick menu for save states, controller rebinding,
+frame-limiter control, reset, and exit.
+
 No emulator core, BIOS, or game assets are included in this repository.
 
 ### How to install
@@ -30,7 +35,9 @@ The launcher creates the rest of the folder tree on first run:
 /switch/nethersx2/
   bios/         <- your PS2 BIOS dump           (you supply)
   resources/    <- shaders / GameIndex / fonts  (auto-extracted per core)
-  covers/       <- cover art (<name>.png)
+  covers/       <- cover art (<game-key>.png)
+  gamecfg/      <- per-game launcher settings
+  forwarders/   <- HOME shortcut launch records
   launcher.ini  <- the launcher's saved config
 ```
 
@@ -52,9 +59,11 @@ pacman -S devkitA64 switch-tools libnx switch-sdl2 switch-sdl2_ttf \
           switch-sdl2_image switch-curl switch-mesa switch-libdrm_nouveau
 ```
 
-The Vulkan renderer links a vendored Mesa NVK build under `vulkan/`. From a
-devkitPro msys2 login shell, build everything — both cores, both renderers, and
-the launcher — into the single `NetherSX2.nro`:
+Provide a compatible Mesa NVK package under `vulkan/include` and `vulkan/lib`.
+Extract the 4248 and 3668 APKs into sibling folders named
+`NetherSX2-v2.2n-4248` and `NetherSX2-v2.2n-3668`, or set `CORES_DIR` to the
+folder containing them. CMake, Ninja, and Git are required; the build downloads pinned
+libsmb2 and libusbhsfs revisions.
 
 ```sh
 ./build_all.sh

@@ -1,6 +1,4 @@
-/* pthr.c -- bionic<->newlib pthread wrappers for libTTapp.so
- *
- * Ported from gm666q/lswtcs-vita (reimpl/pthr.c), adapted for devkitA64/libnx.
+/* pthr.c -- bionic-to-newlib pthread wrappers
  *
  * This software may be modified and distributed under the terms
  * of the MIT license.  See the LICENSE file for details.
@@ -14,7 +12,6 @@
 
 #include "pthr.h"
 #include "util.h"
-#include "so_util.h"
 
 // set in the trampoline when the game's renderThread_main starts; the GL
 // ownership layer lets this thread keep the real context across parks, so its
@@ -103,7 +100,7 @@ static int mutex_static_init(pthread_mutex_t_bionic *mutex, const pthread_mutexa
     __atomic_store_n(&mutex->magic, PTHR_MUTEX_MAGIC, __ATOMIC_RELEASE);
   } else {
     free(real);
-    debugPrintf("pthr: mutex init for %p failed (%d)\n", (void *)mutex, ret);
+
   }
   mutexUnlock(&init_lock);
   return ret;
@@ -127,37 +124,13 @@ static int cond_static_init(pthread_cond_t_bionic *cond, const pthread_condattr_
     __atomic_store_n(&cond->magic, PTHR_COND_MAGIC, __ATOMIC_RELEASE);
   } else {
     free(real);
-    debugPrintf("pthr: cond init for %p failed (%d)\n", (void *)cond, ret);
+
   }
   mutexUnlock(&init_lock);
   return ret;
 }
 
-// ---------------------------------------------------------------------------
-// core affinity for NetherSX2's thread model.
-//
-// PS2 emulation parallelizes into a few HEAVY threads -- the EE/VM thread
-// (main.c's emu_thread, ~99% busy), the MTGS thread (GS command processing),
-// and, when MTVU is enabled, the VU1 thread -- plus LIGHT background threads
-// (audio playback, GS-ring / texture workers). libnx starts every thread on the
-// same default core, so without explicit affinity the whole emulator
-// time-shares ONE cpu while the others sit idle -- the "running on one core"
-// symptom. We spread the work:
-//
-//   core 0             : EE/VM thread, kept to itself (the hot path)
-//   cores 1 .. N-2     : MTGS + VU1 + emucore workers, round-robined
-//   core N-1 (if N>=4) : audio + other background threads
-//
-// Each heavy thread gets a DISTINCT preferred core but a WIDE affinity mask
-// (all hot cores), so Horizon spreads them by default yet can still migrate one
-// off a momentarily-contended core. On a 4-core grant the top core (core 3, the
-// Switch system core) is reserved for light background work so heavy emulation
-// never fights the OS audio/HID/fs servers.
-//
-// (The Vita-port role system this replaced keyed off that engine's thread names
-// -- AndroidMain/renderThread/NuThread -- which never match PS2's EE/GS/VU, so
-// every emucore thread fell through to a single background core.)
-// ---------------------------------------------------------------------------
+// Keep the EE isolated and distribute emulator workers across remaining cores.
 
 static Mutex core_lock;
 static int      core_count = 0;
@@ -205,8 +178,7 @@ static void core_init_once(void) {
     work_list[work_count++] = ee_core;
   work_mask = (hot_count >= 2) ? (hot_mask & ~(1u << ee_core)) : hot_mask;
 
-  debugPrintf("pthr: %d cores (mask 0x%x): EE=core %d, work=%d core(s) mask 0x%x, bg=core %d\n",
-              core_count, (unsigned)mask, ee_core, work_count, work_mask, bg_core);
+
 }
 
 // EE/VM thread: hard-pinned to its own core (exclusive mask) -- it is the
@@ -217,7 +189,7 @@ void pthr_pin_ee_core(void) {
   const int core = ee_core; const unsigned m = 1u << ee_core;
   mutexUnlock(&core_lock);
   svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, m);
-  debugPrintf("pthr: EE/VM thread pinned to core %d (mask 0x%x)\n", core, m);
+
 }
 
 // heavy emucore threads (MTGS, VU1, ring/texture workers): distinct preferred
@@ -254,33 +226,64 @@ typedef struct {
   void *arg;
 } ThreadStart;
 
+typedef struct DetachedThread {
+  pthread_t thread;
+  struct DetachedThread *next;
+} DetachedThread;
+
+static pthread_mutex_t thread_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t thread_cond = PTHREAD_COND_INITIALIZER;
+static DetachedThread *detach_head;
+static DetachedThread *detach_tail;
+static pthread_t detach_reaper;
+static unsigned active_core_threads;
+static int detach_reaper_started;
+static int detach_reaper_stop;
+
+static void *detach_reaper_main(void *unused) {
+  (void)unused;
+  for (;;) {
+    pthread_mutex_lock(&thread_lock);
+    while (!detach_head && !detach_reaper_stop)
+      pthread_cond_wait(&thread_cond, &thread_lock);
+    DetachedThread *item = detach_head;
+    if (item) {
+      detach_head = item->next;
+      if (!detach_head)
+        detach_tail = NULL;
+    } else if (detach_reaper_stop) {
+      pthread_mutex_unlock(&thread_lock);
+      return NULL;
+    }
+    pthread_mutex_unlock(&thread_lock);
+
+    pthread_join(item->thread, NULL);
+    free(item);
+  }
+}
+
 static void *thread_trampoline(void *p) {
   ThreadStart s = *(ThreadStart *)p;
   free(p);
   pthr_install_fake_tls();
-  // every emucore-spawned thread is a heavy worker (MTGS, VU1, ring/texture);
-  // spread them across the work pool. The EE/VM thread and the audio threads are
-  // pinned separately -- they don't come through here.
+  // Keep emulator workers off the EE and audio cores.
   assign_work_core();
-  {
-    extern so_module emu_mod;
-    debugPrintf("pthr: thread entering start fn=%p (emucore+0x%lx) arg=%p\n",
-                (void *)s.start,
-                (unsigned long)((uintptr_t)s.start - (uintptr_t)emu_mod.load_virtbase),
-                s.arg);
-  }
   void *ret = s.start(s.arg);
-  debugPrintf("pthr: thread fn=%p returned\n", (void *)s.start);
-  // unconditional: a thread exiting while owning the GL context would orphan
-  // it forever (EGL bindings are per-thread; nobody else can release it)
+  // EGL ownership is thread-local.
   extern void egl_gl_ownership_release(void);
   egl_gl_ownership_release();
+  pthread_mutex_lock(&thread_lock);
+  active_core_threads--;
+  pthread_cond_broadcast(&thread_cond);
+  pthread_mutex_unlock(&thread_lock);
   return ret;
 }
 
 int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr,
                             void *(*start)(void *), void *param) {
   ThreadStart *s = malloc(sizeof(*s));
+  if (!s)
+    return ENOMEM;
   s->start = start;
   s->arg = param;
 
@@ -296,15 +299,76 @@ int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr
       pthread_attr_setstacksize(&a, want);
   }
 
+  pthread_mutex_lock(&thread_lock);
+  active_core_threads++;
+  pthread_mutex_unlock(&thread_lock);
+
   int ret = pthread_create(thread, &a, thread_trampoline, s);
   pthread_attr_destroy(&a);
-  if (ret != 0)
+  if (ret != 0) {
+    pthread_mutex_lock(&thread_lock);
+    active_core_threads--;
+    pthread_cond_broadcast(&thread_cond);
+    pthread_mutex_unlock(&thread_lock);
     free(s);
+  }
   return ret;
 }
 
 int pthread_join_soloader(pthread_t thread, void **value_ptr) { return pthread_join(thread, value_ptr); }
-int pthread_detach_soloader(pthread_t thread) { return pthread_detach(thread); }
+
+int pthread_detach_soloader(pthread_t thread) {
+  if (!thread)
+    return ESRCH;
+
+  DetachedThread *item = malloc(sizeof(*item));
+  if (!item)
+    return ENOMEM;
+  item->thread = thread;
+  item->next = NULL;
+
+  pthread_mutex_lock(&thread_lock);
+  if (!detach_reaper_started) {
+    int ret = pthread_create(&detach_reaper, NULL, detach_reaper_main, NULL);
+    if (ret != 0) {
+      pthread_mutex_unlock(&thread_lock);
+      free(item);
+      return ret;
+    }
+    detach_reaper_started = 1;
+  }
+  if (detach_tail)
+    detach_tail->next = item;
+  else
+    detach_head = item;
+  detach_tail = item;
+  pthread_cond_signal(&thread_cond);
+  pthread_mutex_unlock(&thread_lock);
+  return 0;
+}
+
+void pthr_shutdown(void) {
+  for (;;) {
+    pthread_mutex_lock(&thread_lock);
+    const unsigned active = active_core_threads;
+    pthread_mutex_unlock(&thread_lock);
+    if (!active)
+      break;
+    svcSleepThread(1000000000ULL);
+  }
+
+  pthread_mutex_lock(&thread_lock);
+  if (!detach_reaper_started) {
+    pthread_mutex_unlock(&thread_lock);
+    return;
+  }
+  detach_reaper_stop = 1;
+  pthread_cond_broadcast(&thread_cond);
+  pthread_mutex_unlock(&thread_lock);
+
+  pthread_join(detach_reaper, NULL);
+  detach_reaper_started = 0;
+}
 pthread_t pthread_self_soloader(void) { return pthread_self(); }
 
 int pthread_equal_soloader(pthread_t t1, pthread_t t2) {
@@ -415,11 +479,9 @@ int pthread_mutex_lock_soloader(pthread_mutex_t_bionic *mutex) {
     return pthread_mutex_lock(mutex->real_ptr);
   // render thread still holding (park keeps it): the mutex holder might want
   // exactly that context, so poll with handover service instead of blocking
-  extern void egl_gl_service_handover(void);
   for (;;) {
     if (pthread_mutex_trylock(mutex->real_ptr) == 0)
       return 0;
-    egl_gl_service_handover();
     struct timespec ts = { 0, 100 * 1000 }; // 0.1 ms
     nanosleep(&ts, NULL);
   }
@@ -497,13 +559,11 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
   // Never loop internally: the game may signal without holding the mutex,
   // and a signal landing between laps is lost forever -- the one-shot
   // level-ready signal then leaves the renderer asleep for good.
-  extern void egl_gl_service_handover(void);
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   timespec_add_ns(&ts, RENDER_WAIT_SLICE_NS);
   int r = pthread_cond_timedwait(cond->real_ptr, mutex->real_ptr, &ts);
   if (r == ETIMEDOUT) {
-    egl_gl_service_handover();
     return 0; // spurious wakeup (POSIX/bionic allow them)
   }
   return r;
@@ -521,7 +581,6 @@ int pthread_cond_timedwait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t
     return pthread_cond_timedwait(cond->real_ptr, mutex->real_ptr, abstime);
   // same single-slice spurious-wakeup scheme as pthread_cond_wait_soloader;
   // the caller's real deadline is only ever reported once it actually passes
-  extern void egl_gl_service_handover(void);
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   timespec_add_ns(&ts, RENDER_WAIT_SLICE_NS);
@@ -529,7 +588,6 @@ int pthread_cond_timedwait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t
   int r = pthread_cond_timedwait(cond->real_ptr, mutex->real_ptr,
                                  final_slice ? abstime : &ts);
   if (r == ETIMEDOUT && !final_slice) {
-    egl_gl_service_handover();
     return 0; // spurious wakeup before the caller's deadline
   }
   return r;

@@ -1,16 +1,16 @@
-// Forwarder exefs stub (nx-hbloader-derived, see LICENSE.md): reads its target
-// from FWD_CFG_DIR/<program_id>.cfg on the SD, then chainloads that NRO.
+// Derived from nx-hbloader; see LICENSE.md.
 #include <switch.h>
 #include <string.h>
 
-#define EXIT_DETECTION_STR "if this isn't replaced i will exit :)"
+#define EXIT_DETECTION_STR "__NETHERSX2_FORWARDER_EXIT__"
+#ifndef FWD_CFG_DIR
+#define FWD_CFG_DIR "/switch/nethersx2/forwarders/"
+#endif
+_Static_assert(sizeof(FWD_CFG_DIR) + 20 <= 64, "forwarder config path is too long");
 
-// this uses 16KiB less than nx-hbloader.
 static char g_argv[2048] = {0};
-// this can and will be modified by libnx if launched nro calls envSetNextLoad().
 static char g_nextArgv[2048] = {0};
 static char g_nextNroPath[FS_MAX_PATH] = {0};
-// stores first launched nro argv + path.
 static char g_defaultArgv[2048] = {0};
 static char g_defaultNroPath[FS_MAX_PATH] = {0};
 
@@ -39,15 +39,11 @@ Result g_lastRet = 0;
 void NX_NORETURN nroEntrypointTrampoline(const ConfigEntry* entries, u64 handle, u64 entrypoint);
 
 static void fix_nro_path(char* path) {
-    // hbmenu prefixes paths with sdmc: which fsFsOpenFile won't like
     if (!strncmp(path, "sdmc:/", 6)) {
-        // memmove(path, path + 5, strlen(path)-5);
-        memmove(path, path + 5, FS_MAX_PATH-5);
+        memmove(path, path + 5, strlen(path + 5) + 1);
     }
 }
 
-// Credit to behemoth
-// SOURCE: https://github.com/HookedBehemoth/nx-hbloader/commit/7f8000a41bc5e8a6ad96a097ef56634cfd2fabcb
 static void NX_NORETURN selfExit(void) {
     Result rc = smInitialize();
     if (R_FAILED(rc))
@@ -62,7 +58,6 @@ static void NX_NORETURN selfExit(void) {
     const u32 cmd_id = 0;
     const u64 reserved = 0;
 
-    // GetSessionProxy
     rc = serviceDispatchIn(&applet, cmd_id, reserved,
         .in_send_pid = true,
         .in_num_handles = 1,
@@ -73,7 +68,6 @@ static void NX_NORETURN selfExit(void) {
     if (R_FAILED(rc))
         goto fail2;
 
-    // GetSelfController
     rc = serviceDispatch(&proxy, 1,
         .out_num_objects = 1,
         .out_objects = &self,
@@ -81,7 +75,6 @@ static void NX_NORETURN selfExit(void) {
     if (R_FAILED(rc))
         goto fail3;
 
-    // Exit
     rc = serviceDispatch(&self, 0);
 
     serviceClose(&self);
@@ -176,6 +169,7 @@ static void getOwnProcessHandle(void) {
         .num_copy_handles = 1,
     ).copy_handles[0] = CUR_PROCESS_HANDLE;
 
+    // The server closes after receiving the copied handle, so no reply is expected.
     svcSendSyncRequest(client_handle);
     svcCloseHandle(client_handle);
 
@@ -197,13 +191,9 @@ static bool isKernel4x(void) {
 
 static void getCodeMemoryCapability(void) {
     if (detectMesosphere()) {
-        // Mesosphère allows for same-process code memory usage.
         g_codeMemoryCapability = CodeMemorySameProcess;
     } else if (isKernel5xOrLater()) {
-        // On [5.0.0+], the kernel does not allow the creator process of a CodeMemory object
-        // to use svcControlCodeMemory on itself, thus returning InvalidMemoryState (0xD401).
-        // However the kernel can be patched to support same-process usage of CodeMemory.
-        // We can detect that by passing a bad operation and observe if we actually get InvalidEnumValue (0xF001).
+        // An invalid operation distinguishes patched same-process support.
         Handle code;
         Result rc = svcCreateCodeMemory(&code, g_heapAddr, 0x1000);
         if (R_SUCCEEDED(rc)) {
@@ -216,10 +206,8 @@ static void getCodeMemoryCapability(void) {
                 g_codeMemoryCapability = CodeMemoryForeignProcess;
         }
     } else if (isKernel4x()) {
-        // On [4.0.0-4.1.0] there is no such restriction on same-process CodeMemory usage.
         g_codeMemoryCapability = CodeMemorySameProcess;
     } else {
-        // This kernel is too old to support CodeMemory syscalls.
         g_codeMemoryCapability = CodeMemoryUnavailable;
     }
 }
@@ -231,20 +219,16 @@ void NX_NORETURN loadNro(void) {
 
     memcpy((u8*)armGetTls() + 0x100, g_savedTls, 0x100);
 
-    // check's if the homebrew replaced nro_path.
-    // if so, load new nro, otherwise, exit.
     if (!strcmp(g_nextArgv, EXIT_DETECTION_STR)) {
         if (!strcmp(g_nextNroPath, g_defaultNroPath)) {
             selfExit();
         } else {
-            // exited nro, now returning to default nro
             strcpy(g_nextNroPath, g_defaultNroPath);
             strcpy(g_nextArgv, g_defaultArgv);
         }
     }
 
     if (g_nroSize) {
-        // checks if nro was previously mapped, if so, unmap
         header = &g_nroHeader;
         rw_size = header->segments[2].size + header->bss_size;
         rw_size = (rw_size+0xFFF) & ~0xFFF;
@@ -253,21 +237,18 @@ void NX_NORETURN loadNro(void) {
             diagAbortWithResult(rc);
         }
 
-        // .text
         rc = svcUnmapProcessCodeMemory(
             g_procHandle, g_nroAddr + header->segments[0].file_off, ((u64) g_heapAddr) + header->segments[0].file_off, header->segments[0].size);
 
         if (R_FAILED(rc))
             diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 24));
 
-        // .rodata
         rc = svcUnmapProcessCodeMemory(
             g_procHandle, g_nroAddr + header->segments[1].file_off, ((u64) g_heapAddr) + header->segments[1].file_off, header->segments[1].size);
 
         if (R_FAILED(rc))
             diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 25));
 
-       // .data + .bss
         rc = svcUnmapProcessCodeMemory(
             g_procHandle, g_nroAddr + header->segments[2].file_off, ((u64) g_heapAddr) + header->segments[2].file_off, rw_size);
 
@@ -280,16 +261,13 @@ void NX_NORETURN loadNro(void) {
 
         g_nroAddr = g_nroSize = 0;
     } else {
-        // First launch: read "nextNroPath\0nextArgv\0" from
-        // sdmc:/switch/nethersx2/forwarders/<program_id>.cfg, keyed by our own program id.
+        // The program ID selects its launcher configuration.
         u64 program_id = 0;
-        svcGetInfo(&program_id, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0);
+        if (R_FAILED(rc = svcGetInfo(&program_id, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0)))
+            diagAbortWithResult(rc);
 
         char cfg_path[64];
         {
-#ifndef FWD_CFG_DIR
-#define FWD_CFG_DIR "/switch/nethersx2/forwarders/"
-#endif
             static const char pre[] = FWD_CFG_DIR;
             static const char hexd[] = "0123456789abcdef";
             int p = 0;
@@ -316,10 +294,18 @@ void NX_NORETURN loadNro(void) {
         }
 
         if (ok) {
-            strcpy(g_nextNroPath, cfg);
-            const u64 n = strlen(cfg) + 1;
-            strcpy(g_nextArgv, (n < br) ? cfg + n : cfg);
-        } else {
+            size_t path_len = strnlen(cfg, br);
+            size_t arg_space = path_len < br ? (size_t)br - path_len - 1 : 0;
+            const char* args = cfg + path_len + 1;
+            size_t arg_len = arg_space ? strnlen(args, arg_space) : 0;
+            ok = path_len > 0 && path_len < br && path_len < sizeof(g_nextNroPath) &&
+                 arg_space > 0 && arg_len < arg_space && arg_len < sizeof(g_nextArgv);
+            if (ok) {
+                memcpy(g_nextNroPath, cfg, path_len + 1);
+                memcpy(g_nextArgv, args, arg_len + 1);
+            }
+        }
+        if (!ok) {
             strcpy(g_nextNroPath, "sdmc:/hbmenu.nro");
             strcpy(g_nextArgv, "sdmc:/hbmenu.nro");
         }
@@ -329,7 +315,6 @@ void NX_NORETURN loadNro(void) {
     }
 
     {
-        // fix paths
         char fixedNextNroPath[FS_MAX_PATH];
         strcpy(fixedNextNroPath, g_nextNroPath);
         fix_nro_path(fixedNextNroPath);
@@ -348,65 +333,72 @@ void NX_NORETURN loadNro(void) {
             diagAbortWithResult(rc);
         }
 
-        // don't fatal if we don't find the nro, exit to menu
         FsFile f;
         if (R_FAILED(rc = fsFsOpenFile(&fs, fixedNextNroPath, FsOpenMode_Read, &f))) {
             diagAbortWithResult(rc);
         }
 
-        u64 bytes_read;
-        if (R_FAILED(rc = fsFileRead(&f, 0, start, g_heapSize, FsReadOption_None, &bytes_read)) ||
-            header->magic != NROHEADER_MAGIC ||
-            bytes_read < sizeof(*start) + sizeof(*header) + header->size) {
-            diagAbortWithResult(rc);
-        }
-
+        u64 bytes_read = 0;
+        rc = fsFileRead(&f, 0, start, g_heapSize, FsReadOption_None, &bytes_read);
         fsFileClose(&f);
         fsFsClose(&fs);
+        if (R_FAILED(rc))
+            diagAbortWithResult(rc);
+        if (bytes_read < sizeof(*start) + sizeof(*header) ||
+            header->magic != NROHEADER_MAGIC ||
+            header->size < sizeof(*start) + sizeof(*header) || header->size > bytes_read)
+            diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 6));
     }
 
-    rw_size = header->segments[2].size + header->bss_size;
-    rw_size = (rw_size+0xFFF) & ~0xFFF;
-
     for (int i = 0; i < 3; i++) {
-        if (header->segments[i].file_off >= header->size || header->segments[i].size > header->size ||
-            (header->segments[i].file_off + header->segments[i].size) > header->size)
+        if (header->segments[i].file_off > header->size ||
+            header->segments[i].size > header->size - header->segments[i].file_off)
         {
             diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 6));
         }
     }
 
-    // todo: Detect whether NRO fits into heap or not.
+    u64 rw_unaligned = (u64)header->segments[2].size + header->bss_size;
+    u64 total_unaligned = (u64)header->size + header->bss_size;
+    if (rw_unaligned > UINT64_MAX - 0xFFF || total_unaligned > UINT64_MAX - 0xFFF)
+        diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 6));
+    rw_size = (size_t)((rw_unaligned + 0xFFF) & ~0xFFFULL);
+    const size_t total_size = (size_t)((total_unaligned + 0xFFF) & ~0xFFFULL);
+    const u64 bss_offset = (u64)header->segments[2].file_off + header->segments[2].size;
+    if (total_size > g_heapSize || bss_offset > total_size ||
+        header->bss_size > total_size - bss_offset)
+        diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 6));
+
+    memset((u8*)g_heapAddr + bss_offset, 0, header->bss_size);
 
     // Copy header to elsewhere because we're going to unmap it next.
     memcpy(&g_nroHeader, header, sizeof(g_nroHeader));
     header = &g_nroHeader;
 
-    // Map code memory to a new randomized address
     virtmemLock();
-    const size_t total_size = (header->size + header->bss_size + 0xFFF) & ~0xFFF;
     void* map_addr = virtmemFindCodeMemory(total_size, 0);
+    if (!map_addr) {
+        virtmemUnlock();
+        diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 18));
+    }
     rc = svcMapProcessCodeMemory(g_procHandle, (u64)map_addr, (u64)g_heapAddr, total_size);
     virtmemUnlock();
 
     if (R_FAILED(rc))
         diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 18));
 
-    // .text
     rc = svcSetProcessMemoryPermission(
         g_procHandle, (u64)map_addr + header->segments[0].file_off, header->segments[0].size, Perm_R | Perm_X);
 
     if (R_FAILED(rc))
         diagAbortWithResult(rc);
 
-    // .rodata
     rc = svcSetProcessMemoryPermission(
         g_procHandle, (u64)map_addr + header->segments[1].file_off, header->segments[1].size, Perm_R);
 
     if (R_FAILED(rc))
         diagAbortWithResult(rc);
 
-    // .data + .bss
     rc = svcSetProcessMemoryPermission(
         g_procHandle, (u64)map_addr + header->segments[2].file_off, rw_size, Perm_Rw);
 
@@ -416,7 +408,6 @@ void NX_NORETURN loadNro(void) {
     const u64 nro_size = header->segments[2].file_off + rw_size;
     const u64 nro_heap_start = ((u64) g_heapAddr) + nro_size;
     const u64 nro_heap_size  = g_heapSize + (u64) g_heapAddr - (u64) nro_heap_start;
-
     #define M EntryFlag_IsMandatory
 
     static ConfigEntry entries[] = {
@@ -438,48 +429,39 @@ void NX_NORETURN loadNro(void) {
     ConfigEntry *entry_Syscalls = &entries[7];
 
     if (!(g_codeMemoryCapability & BIT(0))) {
-        // Revoke access to svcCreateCodeMemory if it's not available.
         entry_Syscalls->Value[0x4B/64] &= ~(1UL << (0x4B%64));
     }
 
     if (!(g_codeMemoryCapability & BIT(1))) {
-        // Revoke access to svcControlCodeMemory if it's not available for same-process usage.
-        entry_Syscalls->Value[0x4C/64] &= ~(1UL << (0x4C%64)); // svcControlCodeMemory
+        entry_Syscalls->Value[0x4C/64] &= ~(1UL << (0x4C%64));
     }
 
-    // MainThreadHandle
     entries[0].Value[0] = envGetMainThreadHandle();
-    // ProcessHandle
     entries[1].Value[0] = g_procHandle;
-    // OverrideHeap
     entries[3].Value[0] = nro_heap_start;
     entries[3].Value[1] = nro_heap_size;
-    // Argv
     entries[4].Value[1] = (u64)(uintptr_t)&g_argv[0];
-    // NextLoadPath
     entries[5].Value[0] = (u64)(uintptr_t)&g_nextNroPath[0];
     entries[5].Value[1] = (u64)(uintptr_t)&g_nextArgv[0];
-    // LastLoadResult
     entries[6].Value[0] = g_lastRet;
-    // RandomSeed
     entries[9].Value[0] = randomGet64();
     entries[9].Value[1] = randomGet64();
-    // HosVersion
     entries[11].Value[0] = hosversionGet();
     entries[11].Value[1] = hosversionIsAtmosphere() ? 0x41544d4f53504852UL : 0; // 'ATMOSPHR'
 
     g_nroAddr = (u64)map_addr;
     g_nroSize = nro_size;
 
-    svcBreak(BreakReason_NotificationOnlyFlag | BreakReason_PostLoadDll, g_nroAddr, nro_size);
+    if (R_FAILED(rc = svcBreak(BreakReason_NotificationOnlyFlag | BreakReason_PostLoadDll, g_nroAddr, nro_size)))
+        diagAbortWithResult(rc);
 
-    // write exit detection
     strcpy(g_nextArgv, EXIT_DETECTION_STR);
-    // jump to trampoline.s
     nroEntrypointTrampoline(&entries[0], -1, g_nroAddr);
 }
 
 int main(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
     memcpy(g_savedTls, (const u8*)armGetTls() + 0x100, 0x100);
     setupHbHeap();
     getOwnProcessHandle();
@@ -487,17 +469,8 @@ int main(int argc, char **argv) {
     loadNro();
 }
 
-// libnx stuff
 u32 __nx_applet_type = AppletType_Application;
-// Minimize fs resource usage
 u32 __nx_fs_num_sessions = 1;
-// these aren't needed, keeping them as someone will eventually
-// copy this code, use fsdev, and not add back these vars.
-u32 __nx_fsdev_direntry_cache_size = 1;
-bool __nx_fsdev_support_cwd = false;
-// enable to always exit to homemenu, dbi does this.
-// u32 __nx_applet_exit_mode = 1;
-// u32 __nx_applet_exit_mode = 0;
 
 void __libnx_initheap(void) {
     extern char* fake_heap_start;
@@ -510,8 +483,7 @@ void __libnx_initheap(void) {
 void __appInit(void) {
     Result rc;
 
-    // Detect Atmosphère early on. This is required for hosversion logic.
-    // In the future, this check will be replaced by detectMesosphere().
+    // Atmosphère is encoded in the version passed to the loaded NRO.
     Handle dummy;
     rc = svcConnectToNamedPort(&dummy, "ams");
     u32 ams_flag = (R_VALUE(rc) != KERNELRESULT(NotFound)) ? BIT(31) : 0;
@@ -535,27 +507,28 @@ void __appInit(void) {
     if (R_FAILED(rc))
         diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, LibnxError_InitFail_FS));
 
-    smExit(); // Close SM as we don't need it anymore.
+    smExit();
 }
 
-void __appExit(void) {
+void __appExit(void) {}
 
-}
-
-// exit() effectively never gets called, so let's stub it out.
+// Abort unexpected libc exit paths.
 void __wrap_exit(void) {
     diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 39));
 }
 
-// stub alloc calls as they're not used (saves 4KiB).
 void* __libnx_alloc(size_t size) {
+    (void)size;
     diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 40));
 }
 
 void* __libnx_aligned_alloc(size_t alignment, size_t size) {
+    (void)alignment;
+    (void)size;
     diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 41));
 }
 
 void __libnx_free(void* p) {
+    (void)p;
     diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 43));
 }

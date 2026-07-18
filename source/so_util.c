@@ -93,6 +93,42 @@ void so_finalize(so_module *mod) {
   free(is_x_page);
 }
 
+uint32_t so_unload(so_module *mod) {
+  if (!mod || !mod->load_virtbase || !mod->load_base || !mod->load_size)
+    return 0;
+
+  const Result rc = svcUnmapProcessCodeMemory(envGetOwnProcessHandle(),
+                                               (u64)mod->load_virtbase,
+                                               (u64)mod->load_base,
+                                               mod->load_size);
+  if (R_FAILED(rc))
+    return rc;
+
+  if (mod->load_memrv) {
+    virtmemLock();
+    virtmemRemoveReservation((VirtmemReservation *)mod->load_memrv);
+    virtmemUnlock();
+  }
+
+  so_module **link = &so_list;
+  while (*link && *link != mod)
+    link = &(*link)->next;
+  if (*link == mod)
+    *link = mod->next;
+
+  mod->next = NULL;
+  mod->load_base = NULL;
+  mod->load_virtbase = NULL;
+  mod->load_size = 0;
+  mod->load_memrv = NULL;
+  mod->elf_hdr = NULL;
+  mod->prog_hdr = NULL;
+  mod->sec_hdr = NULL;
+  mod->syms = NULL;
+  mod->dynstrtab = NULL;
+  return 0;
+}
+
 int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
   int res = 0;
 
@@ -127,7 +163,7 @@ int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
   mod->shstrtab = (char *)((uintptr_t)mod->so_base + mod->sec_hdr[mod->elf_hdr->e_shstrndx].sh_offset);
 
   if (mod->elf_hdr->e_phnum > SO_MAX_SEGMENTS * 2) {
-    debugPrintf("so_load: %s has too many program headers (%d)\n", filename, mod->elf_hdr->e_phnum);
+
     res = -4;
     goto err_free_so;
   }
@@ -149,9 +185,7 @@ int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
   // align total size to page size
   mod->load_size = ALIGN_MEM(mod->load_size, 0x1000);
   if (mod->load_size > max_size) {
-    debugPrintf("so_load: %s needs %u MB load region but only %u MB available "
-                "(raise SO_REGION_MB)\n", filename,
-                (u32)(mod->load_size / 1048576), (u32)(max_size / 1048576));
+
     res = -3;
     goto err_free_so;
   }
@@ -166,7 +200,7 @@ int so_load(so_module *mod, const char *filename, void *base, size_t max_size) {
   mod->load_memrv = virtmemAddReservation(mod->load_virtbase, mod->load_size);
   virtmemUnlock();
 
-  debugPrintf("%s: load base = %p, size = %u KB\n", filename, mod->load_virtbase, (u32)(mod->load_size / 1024));
+
 
   // copy segments to where they belong, then fix up the runtime phdrs to
   // point into the virtual address space
@@ -258,7 +292,6 @@ static void so_process_relr(so_module *mod, const Elf64_Xword *relr, size_t relr
 }
 
 int so_relocate(so_module *mod) {
-  int deferred_abs64 = 0;
 
   for (int i = 0; i < mod->elf_hdr->e_shnum; i++) {
     char *sh_name = mod->shstrtab + mod->sec_hdr[i].sh_name;
@@ -275,7 +308,6 @@ int so_relocate(so_module *mod) {
               // Imported absolute relocations (notably RTTI/type_info vtable
               // references) must be resolved after all modules are loaded.
               *ptr = rels[j].r_addend;
-              deferred_abs64++;
             } else {
               *ptr = (uintptr_t)mod->load_virtbase + sym->st_value + rels[j].r_addend;
             }
@@ -310,12 +342,9 @@ int so_relocate(so_module *mod) {
     relr_size = so_dynamic_tag(mod, DT_ANDROID_RELRSZ);
   }
   if (relr_off && relr_size) {
-    debugPrintf("%s: processing %u bytes of RELR relocations\n", mod->name, (u32)relr_size);
+
     so_process_relr(mod, (const Elf64_Xword *)((uintptr_t)mod->load_base + relr_off), relr_size);
   }
-
-  if (deferred_abs64)
-    debugPrintf("%s: deferred %d ABS64 imports\n", mod->name, deferred_abs64);
 
   return 0;
 }
@@ -358,8 +387,6 @@ static uintptr_t so_resolve_symbol(so_module *mod, DynLibFunction *funcs, int nu
 }
 
 int so_resolve(so_module *mod, DynLibFunction *funcs, int num_funcs, int taint_missing_imports) {
-  int missing = 0;
-  int resolved_abs64 = 0;
   for (int i = 0; i < mod->elf_hdr->e_shnum; i++) {
     char *sh_name = mod->shstrtab + mod->sec_hdr[i].sh_name;
     if (strcmp(sh_name, ".rela.dyn") == 0 || strcmp(sh_name, ".rela.plt") == 0) {
@@ -379,12 +406,7 @@ int so_resolve(so_module *mod, DynLibFunction *funcs, int num_funcs, int taint_m
               uintptr_t addr = so_resolve_symbol(mod, funcs, num_funcs, name);
               if (addr) {
                 *ptr = addr + rels[j].r_addend;
-                if (type == R_AARCH64_ABS64)
-                  resolved_abs64++;
               } else {
-                missing++;
-                debugPrintf("%s: unresolved import: %s\n", mod->name, name);
-                // make it crash in an obvious location for debugging
                 if (taint_missing_imports)
                   *ptr = rels[j].r_offset;
               }
@@ -399,11 +421,6 @@ int so_resolve(so_module *mod, DynLibFunction *funcs, int num_funcs, int taint_m
       }
     }
   }
-
-  if (missing)
-    debugPrintf("%s: %d unresolved imports\n", mod->name, missing);
-  if (resolved_abs64)
-    debugPrintf("%s: resolved %d ABS64 imports\n", mod->name, resolved_abs64);
 
   return 0;
 }

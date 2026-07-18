@@ -122,7 +122,6 @@ long syscall_fake(long number, ...) {
     case ARM64_SYS_GETTID:
       return gettid_fake();
   }
-  debugPrintf("libc: syscall(%ld) -> ENOSYS\n", number);
   errno = ENOSYS;
   return -1;
 }
@@ -138,7 +137,7 @@ int sched_get_priority_max_fake(int policy) {
 }
 
 void android_set_abort_message_fake(const char *msg) {
-  debugPrintf("abort message: %s\n", msg ? msg : "(null)");
+  (void)msg;
 }
 
 size_t __ctype_get_mb_cur_max_fake(void) {
@@ -147,6 +146,27 @@ size_t __ctype_get_mb_cur_max_fake(void) {
 
 int __register_atfork_fake(void) {
   return 0;
+}
+
+extern int __cxa_atexit(void (*destructor)(void *), void *argument, void *dso_handle);
+extern void __cxa_finalize(void *dso_handle);
+
+static char core_dso_handle;
+static int core_finalized;
+
+int __cxa_atexit_fake(void (*destructor)(void *), void *argument, void *dso_handle) {
+  (void)dso_handle;
+  return __cxa_atexit(destructor, argument, &core_dso_handle);
+}
+
+void __cxa_finalize_fake(void *dso_handle) {
+  (void)dso_handle;
+  libc_finalize_core();
+}
+
+void libc_finalize_core(void) {
+  if (!__atomic_exchange_n(&core_finalized, 1, __ATOMIC_ACQ_REL))
+    __cxa_finalize(&core_dso_handle);
 }
 
 // bionic sysconf constants
@@ -167,48 +187,26 @@ long sysconf_fake(int name) {
     case BIONIC_SC_PHYS_PAGES:
       return (3ll * 1024 * 1024 * 1024) / 0x1000;
     default:
-      debugPrintf("libc: sysconf(%d) -> -1\n", name);
+
       return -1;
   }
 }
 
-// High-resolution clock for all clock ids. The game's frame timer
-// (NuTimeGetTicks) calls clock_gettime(CLOCK_REALTIME) and busy-waits in
-// NuFrameEnd until the microsecond delta reaches the frame budget -- so the
-// clock MUST advance at real-time rate with sub-millisecond resolution.
-// newlib's CLOCK_REALTIME on the Switch is RTC-backed and effectively static
-// here, which froze that loop forever (the post-audio 100%-CPU hang). We back
-// every clock id with the 19.2 MHz system tick, like the Vita port uses
-// sceKernelGetProcessTimeWide. A fixed epoch base keeps tv_sec plausible for
-// any absolute-time consumer; it cancels out of the deltas the game computes.
-#define FAKE_EPOCH_BASE 1700000000ull // ~2023-11, seconds
+// The core's frame timer needs a monotonic sub-millisecond clock.
+#define FAKE_EPOCH_BASE 1700000000ull
 
 int clock_gettime_fake(int clk_id, struct timespec *tp) {
   (void)clk_id;
   if (!tp)
     return -1;
-  // the NuFrameEnd busy-wait spins here without GL or blocking; make the
-  // spin a hand-over service point or it can hold the context forever
-  extern void egl_gl_service_handover(void);
-  egl_gl_service_handover();
   static u64 freq = 0;
   if (!freq)
-    freq = armGetSystemTickFreq(); // 19200000 on the Switch
+    freq = armGetSystemTickFreq();
   const u64 tick = armGetSystemTick();
   tp->tv_sec = (time_t)(FAKE_EPOCH_BASE + tick / freq);
   tp->tv_nsec = (long)(((tick % freq) * 1000000000ull) / freq);
   return 0;
 }
-
-// ---------------------------------------------------------------------------
-// path remapping
-//
-// The startup natives hand the game Android-absolute paths (INTERNAL_PATH and
-// the four asset-pack .dat paths). The game concatenates and opens these, so
-// every filesystem entry point rewrites that prefix onto the game directory
-// (the process cwd, which the launcher sets to the .nro's folder). Mirrors
-// lswtcs-vita's fix_path().
-// ---------------------------------------------------------------------------
 
 const char *fix_path(const char *path) {
   static _Thread_local char buf[2][1024];
@@ -216,14 +214,7 @@ const char *fix_path(const char *path) {
 
   if (!path)
     return path;
-  debugPrintf("fs: %s\n", path); // every fopen/open/stat/mkdir funnels here
-
-  // NetherSX2 is driven entirely with absolute SD paths derived from DataRoot
-  // (/switch/nethersx2/...) plus the resources dir, so the normal case is a
-  // pass-through. We only redirect stray Android-internal app paths the core
-  // might synthesize, mapping them under DataRoot so they land on the SD card
-  // instead of failing. (The Android private data dir prefix and the legacy
-  // /sdcard /storage/emulated prefixes.)
+  // Redirect Android application paths into the data directory.
   static const char *const android_prefixes[] = {
     "/data/user/0/xyz.aethersx2.android/files",
     "/data/data/xyz.aethersx2.android/files",
@@ -289,15 +280,9 @@ int remove_fake(const char *path) {
 }
 
 int rename_fake(const char *from, const char *to) {
-  // both sides need remapping; fix_path uses two rotating buffers so a single
-  // call to each is safe before we hand them to rename()
   const char *f = fix_path(from);
   const char *t = fix_path(to);
-  // Horizon's filesystem RenameFile FAILS if the destination already exists,
-  // whereas POSIX rename() atomically replaces it. The game saves atomically
-  // (write "<save>.incomplete", then rename over "<save>"), so without
-  // clearing the existing target first every save after the first silently
-  // fails and all progress is lost on reload. remove() gives POSIX semantics.
+  // Horizon rename does not replace an existing destination.
   remove(t);
   return rename(f, t);
 }
@@ -529,13 +514,7 @@ static int is_fake_file(const void *f) {
 
 size_t fwrite_fake(const void *ptr, size_t size, size_t n, FILE *f) {
   if (is_fake_file(f)) {
-#ifdef DEBUG_LOG
-    static char buf[0x400];
-    const size_t total = size * n < sizeof(buf) - 1 ? size * n : sizeof(buf) - 1;
-    memcpy(buf, ptr, total);
-    buf[total] = '\0';
-    debugPrintf("stdio: %s", buf);
-#endif
+    (void)ptr; (void)size;
     return n;
   }
   return fwrite(ptr, size, n, f);
@@ -555,7 +534,7 @@ int fputc_fake(int c, FILE *f) {
 
 int fputs_fake(const char *s, FILE *f) {
   if (is_fake_file(f)) {
-    debugPrintf("stdio: %s", s);
+    (void)s;
     return 0;
   }
   return fputs(s, f);
@@ -590,13 +569,8 @@ int fprintf_fake(FILE *f, const char *fmt, ...) {
   va_start(va, fmt);
   int ret;
   if (is_fake_file(f)) {
-#ifdef DEBUG_LOG
-    static char buf[0x400];
-    ret = vsnprintf(buf, sizeof(buf), fmt, va);
-    debugPrintf("stdio: %s", buf);
-#else
+    (void)fmt;
     ret = 0;
-#endif
   } else {
     ret = vfprintf(f, fmt, va);
   }
@@ -606,14 +580,8 @@ int fprintf_fake(FILE *f, const char *fmt, ...) {
 
 int vfprintf_fake(FILE *f, const char *fmt, va_list va) {
   if (is_fake_file(f)) {
-#ifdef DEBUG_LOG
-    static char buf[0x400];
-    int ret = vsnprintf(buf, sizeof(buf), fmt, va);
-    debugPrintf("stdio: %s", buf);
-    return ret;
-#else
+    (void)fmt; (void)va;
     return 0;
-#endif
   }
   return vfprintf(f, fmt, va);
 }
@@ -641,7 +609,7 @@ FILE *fopen_fake(const char *path, const char *mode) {
     const char *leaf = path + 24;
     const char *content = (!strcmp(leaf, "kernel_max")) ? "63\n" : "0-3\n";
     FILE *m = fmemopen((void *)content, strlen(content), "r");
-    debugPrintf("fopen(%s) -> synthetic '%s'\n", path, content);
+
     if (m) return m;
   }
   const char *p = fix_path(path);
@@ -651,10 +619,6 @@ FILE *fopen_fake(const char *path, const char *mode) {
     if (ext && strcasecmp(ext, ".dat") == 0)
       setvbuf(f, NULL, _IOFBF, 256 * 1024);
   }
-  if (!f)
-    debugPrintf("fopen(%s => %s, %s) FAILED\n", path, p, mode);
-  else
-    debugPrintf("fopen(%s, %s) ok\n", p, mode);
   return f;
 }
 
@@ -662,25 +626,13 @@ FILE *fopen_fake(const char *path, const char *mode) {
 // ANativeWindow -> NWindow mapping
 // ---------------------------------------------------------------------------
 
-// NOTE: a custom aspect-fitted VI layer was tried and does not work here --
-// viCreateLayer only yields a STRAY layer (libnx exposes no viOpenLayer), and
-// stray layers cannot be resized or positioned, so viSetLayerSize/Position fail
-// with 0x1272 (VI, desc 9). We keep the default full-panel window; the core
-// aspect-fits and centres its own draw rect (ComputeDrawRectangle patch).
 void *ANativeWindow_fromSurface_fake(void *env, void *surface) {
   (void)env;
-  // a NULL Surface means "no window" (the core's pause path) -> return NULL so
-  // it takes the surfaceless/pbuffer branch instead of binding the default win
-  if (surface == NULL) {
-    debugPrintf("ANativeWindow_fromSurface(NULL) -> NULL (surfaceless)\n");
+  if (surface == NULL)
     return NULL;
-  }
   NWindow *win = nwindowGetDefault();
   nwindowSetDimensions(win, screen_width, screen_height);
   nwindowSetCrop(win, 0, 0, screen_width, screen_height);
-  u32 cw = 0, ch = 0;
-  nwindowGetDimensions(win, &cw, &ch);
-  debugPrintf("ANativeWindow_fromSurface -> %p dims=%ux%u\n", win, cw, ch);
   return win;
 }
 
@@ -704,7 +656,6 @@ void ANativeWindow_release_fake(void *win) {
 
 int ANativeWindow_setBuffersGeometry_fake(void *win, int w, int h, int format) {
   (void)format;
-  debugPrintf("ANativeWindow_setBuffersGeometry(%d, %d)\n", w, h);
   if (w > 0 && h > 0)
     nwindowSetDimensions((NWindow *)win, w, h);
   return 0;
@@ -785,89 +736,6 @@ int AndroidBitmap_unlockPixels_fake(void *env, void *bitmap) {
   return ANDROID_BITMAP_RESULT_SUCCESS;
 }
 
-// ASharedMemory_create(name, size) -> fd. THIS IS LOAD-BEARING: AetherSX2's
-// VirtualMemoryManager (the PS2 RAM / VTLB backing) is created over an ashmem
-// region so it can be mmap'd. The core dlopen's libandroid.so + dlsym's this
-// (API-26 compat). Horizon has no memfd/ashmem and no functional file mmap, so
-// we back the "fd" with a page-aligned heap buffer and a fake high-numbered fd;
-// mmap_fake(fd) then hands out views into that buffer (see below). Without this,
-// the VMManager base stays null and VtlbMemoryReserve aborts.
-//
-// (Fastmem RAM mirrors -- the same physical RAM at many host addresses -- are NOT
-// possible on Horizon; see main.c. This is a single linear backing = software VTLB.)
-#define ASHMEM_FD_BASE 0x40000000
-#define MAX_ASHMEM     16
-typedef struct { int used; void *ptr; size_t size; } AshmemRegion;
-static AshmemRegion g_ashmem[MAX_ASHMEM];
-static Mutex g_ashmem_lock;
-
-// returns the region for a fake ashmem fd, or NULL if fd isn't one of ours
-static AshmemRegion *ashmem_get(int fd) {
-  if (fd < ASHMEM_FD_BASE || fd >= ASHMEM_FD_BASE + MAX_ASHMEM) return NULL;
-  AshmemRegion *r = &g_ashmem[fd - ASHMEM_FD_BASE];
-  return r->used ? r : NULL;
-}
-
-int ASharedMemory_create_fake(const char *name, size_t size) {
-  size_t sz = (size + 0xFFF) & ~(size_t)0xFFF;
-  void *p = memalign(0x1000, sz);
-  if (!p) {
-    debugPrintf("ashmem: create '%s' size=%zu FAILED (oom)\n", name ? name : "?", size);
-    errno = ENOMEM;
-    return -1;
-  }
-  memset(p, 0, sz);
-  mutexLock(&g_ashmem_lock);
-  int fd = -1;
-  for (int i = 0; i < MAX_ASHMEM; i++) {
-    if (!g_ashmem[i].used) { g_ashmem[i] = (AshmemRegion){ 1, p, sz }; fd = ASHMEM_FD_BASE + i; break; }
-  }
-  mutexUnlock(&g_ashmem_lock);
-  if (fd < 0) { free(p); errno = EMFILE; return -1; }
-  debugPrintf("ashmem: create '%s' size=%zu -> fd=%d ptr=%p\n", name ? name : "?", size, fd, p);
-  return fd;
-}
-
-// close() shim: ashmem fds are kept alive (their backing stays mapped); real fds
-// forward to newlib. The core closes the ashmem fd after mmap -- the mapping must
-// survive, so we DON'T free the backing here (it lives for the session).
-int close_fake(int fd) {
-  if (ashmem_get(fd)) { debugPrintf("ashmem: close fd=%d (kept)\n", fd); return 0; }
-  return close(fd);
-}
-
-// ashmem ioctl handler. AetherSX2 calls ASharedMemory_create THEN configures the
-// fd with the raw ashmem ioctls (SET_NAME/SET_SIZE) and bails if SET_SIZE fails.
-// Our region is already created at the right size, so SET_* just succeed; GET_SIZE
-// returns it. Codes: _IOW(0x77,n,..) -- SET_NAME=0x41007701, SET_SIZE=0x40087703,
-// GET_SIZE=0x7704, SET_PROT_MASK=0x40087705, GET_PROT_MASK=0x7706.
-// Returns 0 and sets *ret if fd is one of ours; -1 if not an ashmem fd.
-int ashmem_ioctl(int fd, unsigned long req, int *ret) {
-  AshmemRegion *r = ashmem_get(fd);
-  if (!r) return -1;
-  switch (req & 0xffffffff) {
-    case 0x00007704: *ret = (int)r->size; break;   // ASHMEM_GET_SIZE
-    case 0x00007706: *ret = 0x7;          break;   // ASHMEM_GET_PROT_MASK -> RWX
-    default:         *ret = 0;            break;   // SET_NAME/SET_SIZE/SET_PROT/PIN... -> ok
-  }
-  debugPrintf("ashmem: ioctl fd=%d req=0x%lx -> %d\n", fd, req, *ret);
-  return 0;
-}
-
-// ---------------------------------------------------------------------------
-// JIT-capable mmap/mprotect/munmap  (THE #1 risk -- PS2 recompiler RX memory)
-//
-// libnx/newlib has no functional mmap. The PS2 recompiler reserves code arenas
-// and toggles them W^X via mprotect. Horizon forbids RWX, but allows a single
-// virtual address to flip between RW and RX if it is "process code memory":
-//   src (heap) --svcMapProcessCodeMemory--> dst (code region)
-//   then svcSetProcessMemoryPermission(dst, Perm_Rw)  for codegen,
-//        svcSetProcessMemoryPermission(dst, Perm_Rx)  to execute.
-// This matches PCSX2's W^X mprotect model. Plain (non-exec) anonymous mappings
-// fall back to aligned heap allocation. FLAG: validate the recompiler arenas on
-// hardware; if a region needs simultaneous RWX this model must change.
-// ---------------------------------------------------------------------------
-
 #ifndef PROT_NONE
 #define PROT_NONE  0x0
 #define PROT_READ  0x1
@@ -881,133 +749,730 @@ int ashmem_ioctl(int fd, unsigned long req, int *ret) {
 #define MAP_ANONYMOUS 0x20
 #define MAP_ANON 0x20
 #endif
+#ifndef MAP_FIXED
+#define MAP_FIXED 0x10
+#endif
 
-#define MMAP_PAGE 0x1000
+#define MMAP_PAGE               0x1000
+#define ASHMEM_FD_BASE 0x40000000
+#define MAX_ASHMEM     16
+#define FASTMEM_AREA_SIZE       0x100000000ULL
+#define FASTMEM_PAGE_COUNT      (FASTMEM_AREA_SIZE / MMAP_PAGE)
+#define FASTMEM_BACKING_MIN     0x08000000ULL
+#define FASTMEM_MAPPED_PAGE_LIMIT 16384u
+#define FASTMEM_ENTRY_EMPTY     UINT32_MAX
+#define FASTMEM_ENTRY_PROTECTED 0x80000000u
+#define FASTMEM_ENTRY_LAZY      0x40000000u
+#define FASTMEM_ENTRY_REMAP     0x20000000u
+#define FASTMEM_ENTRY_PAGE_MASK 0x000fffffu
+#define FASTMEM_ENTRY_FD_SHIFT  20
+#define FASTMEM_FAULT_BATCH_PAGES 16u
+
+typedef struct {
+  int used;
+  void *raw;
+  void *ptr;
+  size_t size;
+  VirtmemReservation *reservation;
+  int alias_backed;
+} AshmemRegion;
+
+static AshmemRegion g_ashmem[MAX_ASHMEM];
+static Mutex g_ashmem_lock;
+static Mutex g_fastmem_lock;
+static FastmemMode g_fastmem_mode = FASTMEM_MODE_OFF;
+static uintptr_t g_fastmem_base;
+static uint32_t *g_fastmem_pages;
+static unsigned g_fastmem_live_pages;
+
+void fastmem_set_mode(FastmemMode mode) {
+  if (mode < FASTMEM_MODE_OFF || mode > FASTMEM_MODE_ON)
+    mode = FASTMEM_MODE_OFF;
+  g_fastmem_mode = mode;
+}
+
+FastmemMode fastmem_get_mode(void) {
+  return g_fastmem_mode;
+}
+
+// returns the region for a fake ashmem fd, or NULL if fd isn't one of ours
+static AshmemRegion *ashmem_get(int fd) {
+  if (fd < ASHMEM_FD_BASE || fd >= ASHMEM_FD_BASE + MAX_ASHMEM) return NULL;
+  AshmemRegion *r = &g_ashmem[fd - ASHMEM_FD_BASE];
+  return r->used == 1 ? r : NULL;
+}
+
+static int ashmem_make_alias(AshmemRegion *region, void *raw, size_t size) {
+  virtmemLock();
+  void *canonical = virtmemFindCodeMemory(size, MMAP_PAGE);
+  VirtmemReservation *reservation = canonical ? virtmemAddReservation(canonical, size) : NULL;
+  virtmemUnlock();
+  if (!canonical || !reservation)
+    return -1;
+
+  const Handle self = envGetOwnProcessHandle();
+  Result rc = svcMapProcessCodeMemory(self, (u64)canonical, (u64)raw, size);
+  if (R_FAILED(rc)) {
+    virtmemLock();
+    virtmemRemoveReservation(reservation);
+    virtmemUnlock();
+
+    return -1;
+  }
+  rc = svcSetProcessMemoryPermission(self, (u64)canonical, size, Perm_Rw);
+  if (R_FAILED(rc)) {
+    const Result undo = svcUnmapProcessCodeMemory(self, (u64)canonical, (u64)raw, size);
+    if (R_FAILED(undo)) {
+
+      return -2;
+    }
+    virtmemLock();
+    virtmemRemoveReservation(reservation);
+    virtmemUnlock();
+
+    return -1;
+  }
+
+  region->raw = raw;
+  region->ptr = canonical;
+  region->size = size;
+  region->reservation = reservation;
+  region->alias_backed = 1;
+
+  return 0;
+}
+
+int ASharedMemory_create_fake(const char *name, size_t size) {
+  size_t sz = (size + 0xFFF) & ~(size_t)0xFFF;
+  void *p = memalign(0x1000, sz);
+  if (!p) {
+
+    errno = ENOMEM;
+    return -1;
+  }
+  memset(p, 0, sz);
+
+  mutexLock(&g_ashmem_lock);
+  int index = -1;
+  for (int i = 0; i < MAX_ASHMEM; i++) {
+    if (!g_ashmem[i].used) {
+      g_ashmem[i].used = -1;
+      index = i;
+      break;
+    }
+  }
+  mutexUnlock(&g_ashmem_lock);
+  if (index < 0) { free(p); errno = EMFILE; return -1; }
+
+  AshmemRegion region = { .used = 1, .raw = p, .ptr = p, .size = sz };
+  int alias_result = 0;
+  if (g_fastmem_mode != FASTMEM_MODE_OFF && sz >= FASTMEM_BACKING_MIN)
+    alias_result = ashmem_make_alias(&region, p, sz);
+  if (alias_result < 0) {
+    mutexLock(&g_ashmem_lock);
+    g_ashmem[index].used = 0;
+    mutexUnlock(&g_ashmem_lock);
+    if (alias_result == -1)
+      free(p);
+    errno = ENOMEM;
+    return -1;
+  }
+
+  mutexLock(&g_ashmem_lock);
+  g_ashmem[index] = region;
+  mutexUnlock(&g_ashmem_lock);
+  const int fd = ASHMEM_FD_BASE + index;
+
+  return fd;
+}
+
+// Ashmem mappings outlive their descriptors.
+int close_fake(int fd) {
+  if (ashmem_get(fd)) return 0;
+  return close(fd);
+}
+
+int ashmem_ioctl(int fd, unsigned long req, int *ret) {
+  AshmemRegion *r = ashmem_get(fd);
+  if (!r) return -1;
+  switch (req & 0xffffffff) {
+    case 0x00007704: *ret = (int)r->size; break;   // ASHMEM_GET_SIZE
+    case 0x00007706: *ret = 0x7;          break;   // ASHMEM_GET_PROT_MASK -> RWX
+    default:         *ret = 0;            break;   // SET_NAME/SET_SIZE/SET_PROT/PIN... -> ok
+  }
+
+  return 0;
+}
+
 #define MAX_MMAP_REGIONS 256
 
 typedef struct {
-  void *dst;     // returned address (NULL if free slot). For code=the RW backing.
-  void *src;     // heap backing (NULL for plain alloc / reservation)
+  void *dst;
+  void *src;
   size_t size;
-  int is_code;   // 0=plain heap, 1=dual-mapped JIT, 2=virtmem reservation
-  void *rv;      // VirtmemReservation* for the code-mem / reserved range (NULL if none)
-  void *code_rx; // executable alias of the backing (code only); NULL otherwise
+  int is_code;
+  VirtmemReservation *rv;
+  void *code_rx;
+  void *code_rw;
+  VirtmemReservation *code_rx_rv;
+  Handle code_handle;
 } MmapRegion;
 
 static MmapRegion g_mmaps[MAX_MMAP_REGIONS];
 static Mutex g_mmap_lock;
 
-// --- dual-mapped JIT redirect table (read by the exception handler, crash.c) ---
-// AetherSX2's recompiler expects RWX: it writes a block to the arena then jumps
-// into it, WITHOUT any mprotect (Horizon also forbids W->X on code memory). So we
-// hand the core a plain RW heap buffer `back`, keep an executable alias `rx` of
-// the same physical pages, and when the core jumps into `back` (instruction abort,
-// RW isn't executable) the handler bumps PC by `delta` (= rx - back) so execution
-// continues in the RX alias. Direct (PC-relative) branches between blocks keep the
-// same delta so they stay in the RX view; only entries from the emucore dispatcher
-// fault-and-redirect. Lock-free array (few arenas, only appended) for handler use.
-// (JitRedirect + these externs are declared in libc_shim.h for crash.c.)
-JitRedirect g_jit_redir[8];
-volatile int g_jit_redir_n = 0;
-static volatile long g_mmap_total = 0; // bytes currently handed to the core via mmap_fake
+#define MAX_JIT_REDIRECTS 8
 
+typedef struct {
+  uintptr_t lo;
+  uintptr_t hi;
+  intptr_t delta;
+} JitRedirect;
 
-// exported for the JNI OOM diagnostic (jni_fake.c)
-long jit_mmap_total_kb(void) { return g_mmap_total / 1024; }
+static JitRedirect g_jit_redir[MAX_JIT_REDIRECTS];
+
+static void remove_reservation(VirtmemReservation **reservation) {
+  if (!reservation || !*reservation)
+    return;
+  virtmemLock();
+  virtmemRemoveReservation(*reservation);
+  virtmemUnlock();
+  *reservation = NULL;
+}
+
+static void jit_redirect_remove_locked(uintptr_t rx) {
+  for (int i = 0; i < MAX_JIT_REDIRECTS; i++) {
+    if (__atomic_load_n(&g_jit_redir[i].lo, __ATOMIC_ACQUIRE) != rx)
+      continue;
+    __atomic_store_n(&g_jit_redir[i].lo, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_jit_redir[i].hi, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_jit_redir[i].delta, 0, __ATOMIC_RELAXED);
+    return;
+  }
+}
+
+int jit_redirect_lookup(uintptr_t address, uintptr_t *redirected) {
+  for (int i = 0; i < MAX_JIT_REDIRECTS; i++) {
+    const uintptr_t lo = __atomic_load_n(&g_jit_redir[i].lo, __ATOMIC_ACQUIRE);
+    if (!lo || address < lo)
+      continue;
+    const uintptr_t hi = __atomic_load_n(&g_jit_redir[i].hi, __ATOMIC_RELAXED);
+    if (address >= hi)
+      continue;
+    const intptr_t delta = __atomic_load_n(&g_jit_redir[i].delta, __ATOMIC_RELAXED);
+    *redirected = (uintptr_t)((intptr_t)address + delta);
+    return 1;
+  }
+  return 0;
+}
+
+static Result release_jit_region_locked(MmapRegion *region) {
+  if (!region || region->is_code != 1)
+    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+  jit_redirect_remove_locked((uintptr_t)region->dst);
+
+  if (region->code_rw) {
+    const Result rc = svcControlCodeMemory(region->code_handle,
+                                            CodeMapOperation_UnmapOwner,
+                                            region->code_rw, region->size, 0);
+    if (R_FAILED(rc))
+      return rc;
+    region->code_rw = NULL;
+    remove_reservation(&region->rv);
+  }
+
+  if (region->code_rx) {
+    const Result rc = svcControlCodeMemory(region->code_handle,
+                                            CodeMapOperation_UnmapSlave,
+                                            region->code_rx, region->size, 0);
+    if (R_FAILED(rc))
+      return rc;
+    region->code_rx = NULL;
+    remove_reservation(&region->code_rx_rv);
+  }
+
+  if (region->code_handle != INVALID_HANDLE) {
+    const Result rc = svcCloseHandle(region->code_handle);
+    if (R_FAILED(rc))
+      return rc;
+    region->code_handle = INVALID_HANDLE;
+  }
+
+  free(region->src);
+  memset(region, 0, sizeof(*region));
+  return 0;
+}
+
+typedef void (*BionicSiginfoHandler)(int, void *, void *);
+typedef struct {
+  uint32_t flags;
+  uint32_t reserved;
+  BionicSiginfoHandler handler;
+  uint64_t mask;
+  void (*restorer)(void);
+} BionicSigaction;
+
+_Static_assert(sizeof(BionicSigaction) == 32, "unexpected bionic sigaction size");
+
+#define BIONIC_SA_SIGINFO 4u
+static BionicSigaction g_signal_actions[64];
+static uint8_t g_signal_action_set[64];
+static Mutex g_signal_lock;
+
+typedef struct {
+  uint32_t unhandled;
+  uint8_t data[508];
+} FaultUcontext;
+
+static void signal_chain_marker(int sig, void *info, void *context) {
+  (void)sig;
+  (void)info;
+  FaultUcontext *uc = (FaultUcontext *)context;
+  if (uc)
+    uc->unhandled = 1;
+}
+
+static BionicSigaction default_signal_action(void) {
+  BionicSigaction action = {0};
+  action.flags = BIONIC_SA_SIGINFO;
+  action.handler = signal_chain_marker;
+  return action;
+}
+
+int sigaction_fake(int sig, const void *act, void *old_act) {
+  if (sig < 0 || sig >= (int)(sizeof(g_signal_actions) / sizeof(g_signal_actions[0]))) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  mutexLock(&g_signal_lock);
+  const BionicSigaction current = g_signal_action_set[sig]
+                                      ? g_signal_actions[sig]
+                                      : default_signal_action();
+  if (old_act)
+    memcpy(old_act, &current, sizeof(current));
+  if (act) {
+    memcpy(&g_signal_actions[sig], act, sizeof(g_signal_actions[sig]));
+    __atomic_store_n(&g_signal_action_set[sig], 1, __ATOMIC_RELEASE);
+  }
+  mutexUnlock(&g_signal_lock);
+  return 0;
+}
+
+static int fastmem_contains(uintptr_t addr, size_t size) {
+  const uintptr_t base = __atomic_load_n(&g_fastmem_base, __ATOMIC_ACQUIRE);
+  return base && size <= FASTMEM_AREA_SIZE && addr >= base &&
+         addr - base <= FASTMEM_AREA_SIZE - size;
+}
+
+static uint32_t fastmem_pack_entry(int index, size_t offset, int protected_page) {
+  uint32_t entry = ((uint32_t)index << FASTMEM_ENTRY_FD_SHIFT) |
+                   ((uint32_t)(offset / MMAP_PAGE) & FASTMEM_ENTRY_PAGE_MASK);
+  if (protected_page)
+    entry |= FASTMEM_ENTRY_PROTECTED;
+  return entry;
+}
+
+static AshmemRegion *fastmem_entry_region(uint32_t entry, size_t *offset) {
+  const int index = (int)((entry >> FASTMEM_ENTRY_FD_SHIFT) & 0xf);
+  AshmemRegion *region = &g_ashmem[index];
+  if (region->used != 1 || !region->alias_backed)
+    return NULL;
+  *offset = (size_t)(entry & FASTMEM_ENTRY_PAGE_MASK) * MMAP_PAGE;
+  if (*offset >= region->size)
+    return NULL;
+  return region;
+}
+
+static Result fastmem_unmap_range_locked(uintptr_t addr, size_t size, int clear) {
+  const uintptr_t base = g_fastmem_base;
+  const size_t first = (size_t)((addr - base) / MMAP_PAGE);
+  const size_t count = size / MMAP_PAGE;
+  const Handle self = envGetOwnProcessHandle();
+
+  for (size_t i = 0; i < count;) {
+    uint32_t entry = __atomic_load_n(&g_fastmem_pages[first + i], __ATOMIC_ACQUIRE);
+    if (entry == FASTMEM_ENTRY_EMPTY) {
+      i++;
+      continue;
+    }
+
+    if (entry & (FASTMEM_ENTRY_LAZY | FASTMEM_ENTRY_PROTECTED)) {
+      if (clear) {
+        __atomic_store_n(&g_fastmem_pages[first + i], FASTMEM_ENTRY_EMPTY,
+                         __ATOMIC_RELEASE);
+      } else if (!(entry & FASTMEM_ENTRY_LAZY)) {
+        __atomic_store_n(&g_fastmem_pages[first + i],
+                         entry | FASTMEM_ENTRY_LAZY | FASTMEM_ENTRY_PROTECTED |
+                             FASTMEM_ENTRY_REMAP,
+                         __ATOMIC_RELEASE);
+      }
+      i++;
+      continue;
+    }
+
+    size_t source_offset;
+    AshmemRegion *region = fastmem_entry_region(entry, &source_offset);
+    if (!region)
+      return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+    size_t run = 1;
+    while (i + run < count) {
+      const uint32_t next_entry = __atomic_load_n(&g_fastmem_pages[first + i + run],
+                                                   __ATOMIC_ACQUIRE);
+      if (next_entry == FASTMEM_ENTRY_EMPTY ||
+          (next_entry & (FASTMEM_ENTRY_LAZY | FASTMEM_ENTRY_PROTECTED)))
+        break;
+      size_t next_offset;
+      AshmemRegion *next_region = fastmem_entry_region(next_entry, &next_offset);
+      if (next_region != region || next_offset != source_offset + run * MMAP_PAGE)
+        break;
+      run++;
+    }
+
+    Result rc = svcUnmapProcessMemory((void *)(addr + i * MMAP_PAGE), self,
+                                      (u64)((uintptr_t)region->ptr + source_offset),
+                                      run * MMAP_PAGE);
+    if (R_FAILED(rc)) {
+
+      return rc;
+    }
+    if (g_fastmem_live_pages >= run)
+      g_fastmem_live_pages -= (unsigned)run;
+    else
+      g_fastmem_live_pages = 0;
+    for (size_t j = 0; j < run; j++) {
+      const uint32_t old = __atomic_load_n(&g_fastmem_pages[first + i + j],
+                                           __ATOMIC_RELAXED);
+      const uint32_t next = clear ? FASTMEM_ENTRY_EMPTY
+                                  : (old | FASTMEM_ENTRY_LAZY |
+                                     FASTMEM_ENTRY_PROTECTED | FASTMEM_ENTRY_REMAP);
+      __atomic_store_n(&g_fastmem_pages[first + i + j], next, __ATOMIC_RELEASE);
+    }
+    i += run;
+  }
+  return 0;
+}
+
+static Result fastmem_map_run_locked(size_t first, size_t count,
+                                     AshmemRegion *region, size_t source_offset) {
+  const uintptr_t destination = g_fastmem_base + first * MMAP_PAGE;
+  const uintptr_t source = (uintptr_t)region->ptr + source_offset;
+  const size_t size = count * MMAP_PAGE;
+
+  const Result rc = svcMapProcessMemory((void *)destination, envGetOwnProcessHandle(),
+                                        source, size);
+  if (R_FAILED(rc))
+    return rc;
+
+  g_fastmem_live_pages += (unsigned)count;
+
+  for (size_t i = 0; i < count; i++) {
+    const uint32_t entry = __atomic_load_n(&g_fastmem_pages[first + i],
+                                           __ATOMIC_RELAXED);
+    __atomic_store_n(&g_fastmem_pages[first + i],
+                     entry & ~(FASTMEM_ENTRY_LAZY | FASTMEM_ENTRY_PROTECTED |
+                               FASTMEM_ENTRY_REMAP),
+                     __ATOMIC_RELEASE);
+  }
+  return 0;
+}
+
+static void *fastmem_map_alias(void *addr, size_t size, int prot,
+                               int ash_index, AshmemRegion *region, size_t offset) {
+  const uintptr_t dst = (uintptr_t)addr;
+  if (!g_fastmem_pages || !fastmem_contains(dst, size) ||
+      !size || (size & (MMAP_PAGE - 1)) ||
+      (dst & (MMAP_PAGE - 1)) || (offset & (MMAP_PAGE - 1)))
+    return MAP_FAILED;
+
+  mutexLock(&g_fastmem_lock);
+  if (R_FAILED(fastmem_unmap_range_locked(dst, size, 1))) {
+    mutexUnlock(&g_fastmem_lock);
+    return MAP_FAILED;
+  }
+
+  const size_t count = size / MMAP_PAGE;
+  const size_t first = (size_t)((dst - g_fastmem_base) / MMAP_PAGE);
+  const uint32_t flags = FASTMEM_ENTRY_LAZY |
+                         ((prot & PROT_WRITE) ? 0 : FASTMEM_ENTRY_PROTECTED);
+  for (size_t i = 0; i < count; i++) {
+    __atomic_store_n(&g_fastmem_pages[first + i],
+                     fastmem_pack_entry(ash_index, offset + i * MMAP_PAGE, 0) | flags,
+                     __ATOMIC_RELEASE);
+  }
+  mutexUnlock(&g_fastmem_lock);
+  return addr;
+}
+
+static int fastmem_lazy_fault_candidate(uintptr_t fault_addr) {
+  uint32_t *pages = __atomic_load_n(&g_fastmem_pages, __ATOMIC_ACQUIRE);
+  const uintptr_t base = __atomic_load_n(&g_fastmem_base, __ATOMIC_ACQUIRE);
+  if (!pages || !base || fault_addr < base || fault_addr - base >= FASTMEM_AREA_SIZE)
+    return 0;
+  const size_t index = (size_t)((fault_addr - base) / MMAP_PAGE);
+  const uint32_t entry = __atomic_load_n(&pages[index], __ATOMIC_ACQUIRE);
+  return entry != FASTMEM_ENTRY_EMPTY && (entry & FASTMEM_ENTRY_LAZY) &&
+         !(entry & FASTMEM_ENTRY_PROTECTED);
+}
+
+static int fastmem_try_resolve_fault(uintptr_t fault_addr) {
+  if (!fastmem_contains(fault_addr, 1))
+    return 0;
+
+  mutexLock(&g_fastmem_lock);
+  if (!g_fastmem_pages || !fastmem_contains(fault_addr, 1)) {
+    mutexUnlock(&g_fastmem_lock);
+    return 0;
+  }
+
+  const size_t first = (size_t)((fault_addr - g_fastmem_base) / MMAP_PAGE);
+  const uint32_t entry = __atomic_load_n(&g_fastmem_pages[first], __ATOMIC_ACQUIRE);
+  if (entry == FASTMEM_ENTRY_EMPTY) {
+    mutexUnlock(&g_fastmem_lock);
+    return 0;
+  }
+  if (entry & FASTMEM_ENTRY_PROTECTED) {
+    mutexUnlock(&g_fastmem_lock);
+    return 0;
+  }
+  if (!(entry & FASTMEM_ENTRY_LAZY)) {
+    mutexUnlock(&g_fastmem_lock);
+    return 0;
+  }
+
+  size_t source_offset;
+  AshmemRegion *region = fastmem_entry_region(entry, &source_offset);
+  if (!region) {
+    mutexUnlock(&g_fastmem_lock);
+    return 0;
+  }
+
+  if (g_fastmem_live_pages >= FASTMEM_MAPPED_PAGE_LIMIT) {
+    mutexUnlock(&g_fastmem_lock);
+    return 0;
+  }
+
+  const size_t available = FASTMEM_MAPPED_PAGE_LIMIT - g_fastmem_live_pages;
+  size_t count = 1;
+  while (count < FASTMEM_FAULT_BATCH_PAGES && count < available &&
+         first + count < FASTMEM_PAGE_COUNT) {
+    const uint32_t next = __atomic_load_n(&g_fastmem_pages[first + count],
+                                          __ATOMIC_ACQUIRE);
+    if (next == FASTMEM_ENTRY_EMPTY || !(next & FASTMEM_ENTRY_LAZY) ||
+        (next & FASTMEM_ENTRY_PROTECTED))
+      break;
+    size_t next_offset;
+    AshmemRegion *next_region = fastmem_entry_region(next, &next_offset);
+    if (next_region != region || next_offset != source_offset + count * MMAP_PAGE)
+      break;
+    count++;
+  }
+
+  Result rc = fastmem_map_run_locked(first, count, region, source_offset);
+  if (R_FAILED(rc) && count > 1)
+    rc = fastmem_map_run_locked(first, 1, region, source_offset);
+  mutexUnlock(&g_fastmem_lock);
+  return R_SUCCEEDED(rc);
+}
+
+static int fastmem_managed_fault(uintptr_t addr) {
+  if (fastmem_contains(addr, 1))
+    return 1;
+  for (int i = 0; i < MAX_ASHMEM; i++) {
+    const AshmemRegion *region = &g_ashmem[i];
+    if (region->used == 1 && region->alias_backed &&
+        addr >= (uintptr_t)region->ptr && addr - (uintptr_t)region->ptr < region->size)
+      return 1;
+  }
+  return 0;
+}
+
+static int fastmem_select_signal_action(int *signal, BionicSigaction *action) {
+  static const int signals[] = {11, 7};
+  for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
+    const int candidate = signals[i];
+    if (!__atomic_load_n(&g_signal_action_set[candidate], __ATOMIC_ACQUIRE))
+      continue;
+    const BionicSigaction selected = g_signal_actions[candidate];
+    if ((uintptr_t)selected.handler <= 1 || selected.handler == signal_chain_marker)
+      continue;
+    *signal = candidate;
+    *action = selected;
+    return 1;
+  }
+  return 0;
+}
+
+int fastmem_fault_can_dispatch(uintptr_t pc, uintptr_t fault_addr) {
+  (void)pc;
+  if (g_fastmem_mode == FASTMEM_MODE_OFF)
+    return 0;
+  if (!fastmem_managed_fault(fault_addr))
+    return 0;
+
+  if (fastmem_lazy_fault_candidate(fault_addr))
+    return 1;
+
+  int sig;
+  BionicSigaction action;
+  if (!fastmem_select_signal_action(&sig, &action))
+    return 0;
+  return 1;
+}
+
+int fastmem_dispatch_fault(uintptr_t pc, uintptr_t fault_addr) {
+  if (!fastmem_fault_can_dispatch(pc, fault_addr))
+    return 0;
+
+  if (fastmem_try_resolve_fault(fault_addr))
+    return 1;
+
+  int sig;
+  BionicSigaction action;
+  if (!fastmem_select_signal_action(&sig, &action))
+    return 0;
+
+  uint8_t siginfo[128] __attribute__((aligned(16))) = {0};
+  FaultUcontext context __attribute__((aligned(16))) = {0};
+  *(int *)(siginfo + 0) = sig;
+  *(uintptr_t *)(siginfo + 16) = fault_addr;
+  *(uintptr_t *)((uint8_t *)&context + 440) = pc;
+
+  if (action.flags & BIONIC_SA_SIGINFO)
+    action.handler(sig, siginfo, &context);
+  else
+    ((void (*)(int))action.handler)(sig);
+  return !context.unhandled;
+}
 
 void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
   if (length == 0) return MAP_FAILED;
   const size_t len = (length + MMAP_PAGE - 1) & ~(size_t)(MMAP_PAGE - 1);
 
-  // ashmem-backed mapping (the PS2 RAM / VTLB backing): hand out a view into the
-  // region's heap buffer. Fastmem (EnableFastmem) is OFF, so the core never asks
-  // for MAP_FIXED mirror pages -- it uses the software VTLB over this single view.
   AshmemRegion *ash = ashmem_get(fd);
   if (ash) {
-    if ((size_t)offset + len > ash->size) {
-      debugPrintf("mmap_fake: ashmem fd=%d off+len (0x%lx) > size (0x%zx) -- FAILED\n",
-                  fd, (unsigned long)offset + len, ash->size);
+    if (offset < 0 || (size_t)offset > ash->size || len > ash->size - (size_t)offset) {
+
       return MAP_FAILED;
     }
-    // MAP_FIXED `addr` is not honored (Horizon can't alias) -- return the canonical
-    // linear view; the core uses the software VTLB.
+
+    if ((flags & MAP_FIXED) && ash->alias_backed &&
+        fastmem_contains((uintptr_t)addr, len))
+      return fastmem_map_alias(addr, len, prot, fd - ASHMEM_FD_BASE, ash, (size_t)offset);
+
     void *src = (char *)ash->ptr + offset;
-    static unsigned long ash_maps = 0;
-    if (ash_maps < 4 || (ash_maps & 0xfff) == 0)
-      debugPrintf("mmap_fake: ashmem fd=%d off=0x%lx len=%lu KB -> %p (map #%lu)\n",
-                  fd, (unsigned long)offset, (unsigned long)(len / 1024), src, ash_maps);
-    ash_maps++;
     return src;
   }
 
-  // verbose log only for the (rare) anonymous / reservation / code-arena maps
-  debugPrintf("mmap_fake: addr=%p len=%lu KB prot=0x%x flags=0x%x fd=%d off=0x%lx\n",
-              addr, (unsigned long)(len / 1024), prot, flags, fd, (unsigned long)offset);
-
   if (fd >= 0)
     return MAP_FAILED;            // other file-backed mappings unsupported
-  (void)flags;
 
-  // Large PROT_NONE anonymous mapping = a pure address-space RESERVATION: the PS2
-  // fastmem window is a 4GB mmap(PROT_NONE) that the core only reserves + records
-  // now (RAM mirrors get mapped into it later). memalign(4GB) is impossible AND
-  // wrong here -- reserve virtual address space via virtmem instead (no commit).
+  if (prot == PROT_NONE && (flags & MAP_FIXED)) {
+    if (g_fastmem_pages && fastmem_contains((uintptr_t)addr, len)) {
+      mutexLock(&g_fastmem_lock);
+      const Result result = fastmem_unmap_range_locked((uintptr_t)addr, len, 1);
+      mutexUnlock(&g_fastmem_lock);
+      if (R_FAILED(result))
+        return MAP_FAILED;
+    }
+    return addr;
+  }
+
+  // PROT_NONE requests reserve address space without committing memory.
   if (prot == PROT_NONE) {
     virtmemLock();
     void *base = virtmemFindAslr(len, 0);
     VirtmemReservation *rv = base ? virtmemAddReservation(base, len) : NULL;
     virtmemUnlock();
-    if (!base) {
-      debugPrintf("mmap_fake: RESERVE %lu KB FAILED (no address space)\n", (unsigned long)(len / 1024));
+    if (!base || !rv) {
+
       return MAP_FAILED;
     }
-    debugPrintf("mmap_fake: RESERVED addr-space %p len=%lu KB (PROT_NONE)\n",
-                base, (unsigned long)(len / 1024));
-    mutexLock(&g_mmap_lock);
-    for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
-      if (!g_mmaps[i].dst) { g_mmaps[i] = (MmapRegion){ base, NULL, len, 2, (void *)rv }; break; }
-    }
-    mutexUnlock(&g_mmap_lock);
-    return base;
-  }
 
-  // non-executable, never-executable data: plain aligned heap is cheapest.
-  // (recompiler data arenas + the PS2 RAM mirrors never need exec.)
-  if (!(prot & PROT_EXEC)) {
-    void *p = memalign(MMAP_PAGE, len);
-    if (!p) { debugPrintf("mmap_fake: memalign(%lu KB) FAILED\n", (unsigned long)(len/1024)); return MAP_FAILED; }
-    g_mmap_total += (long)len;
-    if (prot == PROT_NONE) { /* leave committed; PROT_NONE rarely enforced */ }
+    uint32_t *fastmem_pages = NULL;
+    if (g_fastmem_mode != FASTMEM_MODE_OFF && len == FASTMEM_AREA_SIZE) {
+      fastmem_pages = malloc(FASTMEM_PAGE_COUNT * sizeof(*fastmem_pages));
+      if (!fastmem_pages) {
+        virtmemLock();
+        virtmemRemoveReservation(rv);
+        virtmemUnlock();
+        errno = ENOMEM;
+        return MAP_FAILED;
+      }
+      memset(fastmem_pages, 0xff, FASTMEM_PAGE_COUNT * sizeof(*fastmem_pages));
+    }
+
+    int tracked = 0;
     mutexLock(&g_mmap_lock);
     for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
       if (!g_mmaps[i].dst) {
-        g_mmaps[i] = (MmapRegion){ p, NULL, len, 0, NULL };
+        g_mmaps[i] = (MmapRegion){
+          .dst = base,
+          .size = len,
+          .is_code = 2,
+          .rv = rv,
+          .code_handle = INVALID_HANDLE,
+        };
+        tracked = 1;
         break;
       }
     }
     mutexUnlock(&g_mmap_lock);
+    if (!tracked) {
+      free(fastmem_pages);
+      virtmemLock();
+      virtmemRemoveReservation(rv);
+      virtmemUnlock();
+      errno = ENOMEM;
+      return MAP_FAILED;
+    }
+
+    if (fastmem_pages) {
+      __atomic_store_n(&g_fastmem_base, (uintptr_t)base, __ATOMIC_RELEASE);
+      __atomic_store_n(&g_fastmem_pages, fastmem_pages, __ATOMIC_RELEASE);
+
+    }
+
+    return base;
+  }
+
+  if (!(prot & PROT_EXEC)) {
+    void *p = memalign(MMAP_PAGE, len);
+    if (!p) {  return MAP_FAILED; }
+    if (prot == PROT_NONE) { /* leave committed; PROT_NONE rarely enforced */ }
+    int tracked = 0;
+    mutexLock(&g_mmap_lock);
+    for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+      if (!g_mmaps[i].dst) {
+        g_mmaps[i] = (MmapRegion){
+          .dst = p,
+          .size = len,
+          .code_handle = INVALID_HANDLE,
+        };
+        tracked = 1;
+        break;
+      }
+    }
+    mutexUnlock(&g_mmap_lock);
+    if (!tracked) {
+      free(p);
+      errno = ENOMEM;
+      return MAP_FAILED;
+    }
     return p;
   }
 
-  // executable JIT arena via CodeMemory DUAL-VIEW. AetherSX2's recompiler writes
-  // machine code then runs it, with no mprotect (Android RWX). Horizon forbids
-  // W^X-violating perms AND svcMapProcessCodeMemory makes the *source* buffer
-  // inaccessible -- so a single mapping can't be both writable and executable, and
-  // the earlier "return the heap src" attempt faulted when the emitter wrote to it.
-  // svcCreateCodeMemory backs a code object from a heap buffer; MapOwner gives a RW
-  // alias and MapSlave a RX alias of the SAME physical pages, BOTH live at once.
-  // Return the RW view; when the core jumps into it (instruction abort, RW isn't
-  // executable) the exception handler redirects to the RX view (+delta). Direct
-  // PC-relative branches keep the same delta so linked blocks stay in the RX view.
-  void *back = memalign(MMAP_PAGE, len);   // physical backing (owned by the code obj)
+  void *back = memalign(MMAP_PAGE, len);
   if (!back) {
-    debugPrintf("mmap_fake: JIT backing memalign(%lu KB) FAILED\n", (unsigned long)(len / 1024));
+
     return MAP_FAILED;
   }
-  Handle ch = 0;
+  Handle ch = INVALID_HANDLE;
   Result rcC = svcCreateCodeMemory(&ch, back, len);
   if (R_FAILED(rcC)) {
-    debugPrintf("mmap_fake: svcCreateCodeMemory(%lu KB) rc=0x%x\n", (unsigned long)(len / 1024), rcC);
+
     free(back);
     return MAP_FAILED;
   }
@@ -1017,85 +1482,293 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, off_t of
   void *rx = virtmemFindCodeMemory(len, MMAP_PAGE);
   VirtmemReservation *rvx = rx ? virtmemAddReservation(rx, len) : NULL;
   virtmemUnlock();
-  Result rcO = (rw && rx) ? svcControlCodeMemory(ch, CodeMapOperation_MapOwner, rw, len, Perm_Rw) : MAKERESULT(1, 1);
-  Result rcS = (rw && rx) ? svcControlCodeMemory(ch, CodeMapOperation_MapSlave, rx, len, Perm_Rx) : MAKERESULT(1, 1);
-  debugPrintf("mmap_fake: JIT CodeMem create rc=0x%x MapOwner(rw=%p) rc=0x%x MapSlave(rx=%p) rc=0x%x delta=0x%lx\n",
-              rcC, rw, rcO, rx, rcS, (unsigned long)((char *)rx - (char *)rw));
-  if (R_FAILED(rcO) || R_FAILED(rcS)) {
-    if (rvw) { virtmemLock(); virtmemRemoveReservation(rvw); virtmemUnlock(); }
-    if (rvx) { virtmemLock(); virtmemRemoveReservation(rvx); virtmemUnlock(); }
+  if (!rw || !rx || !rvw || !rvx) {
+    remove_reservation(&rvw);
+    remove_reservation(&rvx);
     svcCloseHandle(ch);
+    free(back);
+    errno = ENOMEM;
+    return MAP_FAILED;
+  }
+
+  Result rcO = svcControlCodeMemory(ch, CodeMapOperation_MapOwner, rw, len, Perm_Rw);
+  Result rcS = R_SUCCEEDED(rcO)
+                   ? svcControlCodeMemory(ch, CodeMapOperation_MapSlave, rx, len, Perm_Rx)
+                   : rcO;
+
+  if (R_FAILED(rcO) || R_FAILED(rcS)) {
+    if (R_SUCCEEDED(rcO))
+      svcControlCodeMemory(ch, CodeMapOperation_UnmapOwner, rw, len, 0);
+    svcCloseHandle(ch);
+    remove_reservation(&rvw);
+    remove_reservation(&rvx);
     free(back);
     return MAP_FAILED;
   }
-  // WRITE-redirect: hand the core the RX (executable) view so recompiled code
-  // runs DIRECTLY with no per-dispatch faults. The recompiler's codegen writes to
-  // RX (which isn't writable) fault (data abort); the exception handler decodes
-  // the store and re-issues it to the RW alias (far + delta, delta = rw - rx).
-  // Writes are far rarer than dispatches -> much faster + fewer exceptions.
-  if (g_jit_redir_n < (int)(sizeof(g_jit_redir) / sizeof(g_jit_redir[0]))) {
-    g_jit_redir[g_jit_redir_n] = (JitRedirect){ (uintptr_t)rx, (uintptr_t)rx + len,
-                                                (intptr_t)((char *)rw - (char *)rx) };
-    g_jit_redir_n++;
-  }
-  g_mmap_total += (long)len;
+  // Writes to the RX view are redirected to the RW alias by the exception handler.
+  MmapRegion region = {
+    .dst = rx,
+    .src = back,
+    .size = len,
+    .is_code = 1,
+    .rv = rvw,
+    .code_rx = rx,
+    .code_rw = rw,
+    .code_rx_rv = rvx,
+    .code_handle = ch,
+  };
+  int tracked = 0;
   mutexLock(&g_mmap_lock);
+  int mmap_index = -1;
+  int redirect_index = -1;
   for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
     if (!g_mmaps[i].dst) {
-      // dst=rx (returned RX view; what the core sees), code_rx=rx, src=back(backing),
-      // rv=rvw. rvx/ch leak on munmap -- the JIT arena is session-lived.
-      g_mmaps[i] = (MmapRegion){ rx, back, len, 1, rvw, rx };
+      mmap_index = i;
       break;
     }
   }
+  for (int i = 0; i < MAX_JIT_REDIRECTS; i++) {
+    if (!__atomic_load_n(&g_jit_redir[i].lo, __ATOMIC_ACQUIRE)) {
+      redirect_index = i;
+      break;
+    }
+  }
+  if (mmap_index >= 0 && redirect_index >= 0) {
+    g_mmaps[mmap_index] = region;
+    __atomic_store_n(&g_jit_redir[redirect_index].hi, (uintptr_t)rx + len,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&g_jit_redir[redirect_index].delta,
+                     (intptr_t)((char *)rw - (char *)rx), __ATOMIC_RELAXED);
+    __atomic_store_n(&g_jit_redir[redirect_index].lo, (uintptr_t)rx, __ATOMIC_RELEASE);
+    tracked = 1;
+  }
   mutexUnlock(&g_mmap_lock);
-  return rx; // the RX execute view; codegen WRITES are redirected to RW via crash.c
+  if (!tracked) {
+    mutexLock(&g_mmap_lock);
+    release_jit_region_locked(&region);
+    mutexUnlock(&g_mmap_lock);
+
+    errno = ENOMEM;
+    return MAP_FAILED;
+  }
+  return rx;
 }
 
 int mprotect_fake(void *addr, size_t length, int prot) {
   const size_t len = (length + MMAP_PAGE - 1) & ~(size_t)(MMAP_PAGE - 1);
-  mutexLock(&g_mmap_lock);
-  for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
-    if (g_mmaps[i].dst == addr || (g_mmaps[i].is_code && addr >= g_mmaps[i].dst &&
-        (char *)addr < (char *)g_mmaps[i].dst + g_mmaps[i].size)) {
-      mutexUnlock(&g_mmap_lock);
-      // Dual-mapped JIT (is_code==1): `back` stays RW, the `rx` alias stays RX --
-      // W^X is handled by the exec-redirect, so the core's mprotect (which Horizon
-      // would reject on code memory anyway) is a no-op. Plain data (0) / bare
-      // reservation (2): nothing to enforce either.
-      (void)len;
-      return 0;
+
+  for (int i = 0; i < MAX_ASHMEM; i++) {
+    AshmemRegion *region = &g_ashmem[i];
+    const uintptr_t start = (uintptr_t)addr;
+    if (region->used != 1 || !region->alias_backed || start < (uintptr_t)region->ptr ||
+        len > region->size || start - (uintptr_t)region->ptr > region->size - len)
+      continue;
+
+    const u32 permission = (prot & PROT_WRITE) ? Perm_Rw
+                           : (prot & PROT_READ) ? Perm_R
+                                                : Perm_None;
+    Result rc = svcSetProcessMemoryPermission(envGetOwnProcessHandle(), start, len, permission);
+    if (R_FAILED(rc)) {
+
+      errno = EACCES;
+      return -1;
     }
+    return 0;
   }
-  mutexUnlock(&g_mmap_lock);
-  // unknown region: best-effort no-op (the core sometimes mprotects its own bss)
+
+  if (g_fastmem_pages && fastmem_contains((uintptr_t)addr, len)) {
+    const uintptr_t start = (uintptr_t)addr;
+    const size_t first = (size_t)((start - g_fastmem_base) / MMAP_PAGE);
+    const size_t count = len / MMAP_PAGE;
+    const int writable = (prot & PROT_WRITE) != 0;
+
+    mutexLock(&g_fastmem_lock);
+    for (size_t i = 0; i < count; i++) {
+      uint32_t entry = __atomic_load_n(&g_fastmem_pages[first + i], __ATOMIC_ACQUIRE);
+      if (entry == FASTMEM_ENTRY_EMPTY)
+        continue;
+
+      size_t source_offset;
+      AshmemRegion *region = fastmem_entry_region(entry, &source_offset);
+      if (!region) {
+        mutexUnlock(&g_fastmem_lock);
+        errno = EINVAL;
+        return -1;
+      }
+
+      if (writable) {
+        if (!(entry & FASTMEM_ENTRY_PROTECTED))
+          continue;
+
+        const int remap = (entry & FASTMEM_ENTRY_REMAP) != 0;
+        uint32_t next = (entry | FASTMEM_ENTRY_LAZY) &
+                        ~(FASTMEM_ENTRY_PROTECTED | FASTMEM_ENTRY_REMAP);
+        __atomic_store_n(&g_fastmem_pages[first + i], next, __ATOMIC_RELEASE);
+        if (!remap)
+          continue;
+        if (g_fastmem_live_pages >= FASTMEM_MAPPED_PAGE_LIMIT) {
+          continue;
+        }
+        fastmem_map_run_locked(first + i, 1, region, source_offset);
+        continue;
+      }
+
+      if (entry & FASTMEM_ENTRY_PROTECTED)
+        continue;
+      if (entry & FASTMEM_ENTRY_LAZY) {
+        __atomic_store_n(&g_fastmem_pages[first + i],
+                         entry | FASTMEM_ENTRY_PROTECTED, __ATOMIC_RELEASE);
+        continue;
+      }
+
+      const uintptr_t destination = start + i * MMAP_PAGE;
+      const uintptr_t source = (uintptr_t)region->ptr + source_offset;
+      const Result rc = svcUnmapProcessMemory((void *)destination,
+                                              envGetOwnProcessHandle(), source,
+                                              MMAP_PAGE);
+      if (R_FAILED(rc)) {
+        mutexUnlock(&g_fastmem_lock);
+
+        errno = EACCES;
+        return -1;
+      }
+      if (g_fastmem_live_pages)
+        g_fastmem_live_pages--;
+      __atomic_store_n(&g_fastmem_pages[first + i],
+                       entry | FASTMEM_ENTRY_LAZY | FASTMEM_ENTRY_PROTECTED |
+                           FASTMEM_ENTRY_REMAP,
+                       __ATOMIC_RELEASE);
+    }
+    mutexUnlock(&g_fastmem_lock);
+    return 0;
+  }
+
   return 0;
 }
 
 int munmap_fake(void *addr, size_t length) {
-  (void)length;
+  const size_t len = (length + MMAP_PAGE - 1) & ~(size_t)(MMAP_PAGE - 1);
+  uint32_t *released_fastmem_pages = NULL;
+  if (g_fastmem_pages && fastmem_contains((uintptr_t)addr, len)) {
+    mutexLock(&g_fastmem_lock);
+    if (R_FAILED(fastmem_unmap_range_locked((uintptr_t)addr, len, 1))) {
+      mutexUnlock(&g_fastmem_lock);
+      errno = EINVAL;
+      return -1;
+    }
+    if ((uintptr_t)addr == g_fastmem_base && len == FASTMEM_AREA_SIZE) {
+      released_fastmem_pages = g_fastmem_pages;
+      __atomic_store_n(&g_fastmem_pages, NULL, __ATOMIC_RELEASE);
+      __atomic_store_n(&g_fastmem_base, 0, __ATOMIC_RELEASE);
+      g_fastmem_live_pages = 0;
+    }
+    mutexUnlock(&g_fastmem_lock);
+    if (!released_fastmem_pages)
+      return 0;
+  }
+
   mutexLock(&g_mmap_lock);
   for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
     if (g_mmaps[i].dst == addr) {
-      MmapRegion r = g_mmaps[i];
-      g_mmaps[i].dst = NULL;
-      if (r.is_code != 2) g_mmap_total -= (long)r.size; // reservations aren't committed
-      mutexUnlock(&g_mmap_lock);
-      if (r.is_code == 2) {
-        // bare address-space reservation: nothing mapped, just release it
-        if (r.rv) { virtmemLock(); virtmemRemoveReservation((VirtmemReservation *)r.rv); virtmemUnlock(); }
-      } else if (r.is_code == 1) {
-        // dual-view JIT (svcCreateCodeMemory): full teardown needs the code handle
-        // and both reservations, which we don't retain -- the JIT arena is session-
-        // lived (created once per VM), so drop it (leak). Release the RW reservation
-        // best-effort; the RX reservation, code handle and backing intentionally leak.
-        if (r.rv) { virtmemLock(); virtmemRemoveReservation((VirtmemReservation *)r.rv); virtmemUnlock(); }
+      MmapRegion *region = &g_mmaps[i];
+      if (region->is_code == 1) {
+        const Result rc = release_jit_region_locked(region);
+        if (R_FAILED(rc)) {
+          mutexUnlock(&g_mmap_lock);
+          free(released_fastmem_pages);
+          errno = EBUSY;
+          return -1;
+        }
+      } else if (region->is_code == 2) {
+        remove_reservation(&region->rv);
+        memset(region, 0, sizeof(*region));
       } else {
-        free(r.dst);
+        free(region->dst);
+        memset(region, 0, sizeof(*region));
       }
+      mutexUnlock(&g_mmap_lock);
+      free(released_fastmem_pages);
       return 0;
     }
   }
   mutexUnlock(&g_mmap_lock);
+  free(released_fastmem_pages);
   return 0;
+}
+
+void libc_memory_shutdown(void) {
+  mutexLock(&g_signal_lock);
+  memset(g_signal_actions, 0, sizeof(g_signal_actions));
+  memset(g_signal_action_set, 0, sizeof(g_signal_action_set));
+  mutexUnlock(&g_signal_lock);
+
+  const uintptr_t fastmem_base = __atomic_load_n(&g_fastmem_base, __ATOMIC_ACQUIRE);
+  uint32_t *fastmem_pages = __atomic_load_n(&g_fastmem_pages, __ATOMIC_ACQUIRE);
+  int fastmem_released = 1;
+  if (fastmem_base || fastmem_pages) {
+    fastmem_released = 0;
+    if (fastmem_base && fastmem_pages) {
+      mutexLock(&g_fastmem_lock);
+      const Result rc = fastmem_unmap_range_locked(fastmem_base,
+                                                    FASTMEM_AREA_SIZE, 1);
+      if (R_SUCCEEDED(rc)) {
+        __atomic_store_n(&g_fastmem_pages, NULL, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_fastmem_base, 0, __ATOMIC_RELEASE);
+        g_fastmem_live_pages = 0;
+        fastmem_released = 1;
+      }
+      mutexUnlock(&g_fastmem_lock);
+      if (fastmem_released)
+        free(fastmem_pages);
+    }
+  }
+
+  mutexLock(&g_mmap_lock);
+  for (int i = 0; i < MAX_JIT_REDIRECTS; i++)
+    __atomic_store_n(&g_jit_redir[i].lo, 0, __ATOMIC_RELEASE);
+  for (int i = 0; i < MAX_MMAP_REGIONS; i++) {
+    MmapRegion *region = &g_mmaps[i];
+    if (!region->dst)
+      continue;
+
+    if (region->is_code == 1) {
+      const Result rc = release_jit_region_locked(region);
+      if (R_FAILED(rc))
+        continue;
+      continue;
+    }
+
+    if (region->is_code == 2) {
+      if (!fastmem_released && (uintptr_t)region->dst == fastmem_base)
+        continue;
+      remove_reservation(&region->rv);
+    } else {
+      free(region->dst);
+    }
+    memset(region, 0, sizeof(*region));
+  }
+  memset(g_jit_redir, 0, sizeof(g_jit_redir));
+  mutexUnlock(&g_mmap_lock);
+
+  mutexLock(&g_ashmem_lock);
+  for (int i = 0; i < MAX_ASHMEM; i++) {
+    AshmemRegion *region = &g_ashmem[i];
+    if (region->used != 1)
+      continue;
+    if (region->alias_backed) {
+      if (!fastmem_released)
+        continue;
+      const Result rc = svcUnmapProcessCodeMemory(envGetOwnProcessHandle(),
+                                                   (u64)region->ptr,
+                                                   (u64)region->raw,
+                                                   region->size);
+      if (R_FAILED(rc)) {
+        continue;
+      }
+      remove_reservation(&region->reservation);
+    }
+    free(region->raw);
+    memset(region, 0, sizeof(*region));
+  }
+  mutexUnlock(&g_ashmem_lock);
 }

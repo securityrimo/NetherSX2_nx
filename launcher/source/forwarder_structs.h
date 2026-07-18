@@ -1,13 +1,11 @@
-// NCA / NPDM / CNMT layouts used to build forwarder NCAs in memory (only the touched fields).
+// Forwarder NCA, NPDM, and CNMT layouts.
 #pragma once
 
 #include <switch.h>
 
-#ifndef NCA3_MAGIC
-#define NCA3_MAGIC 0x3341434E
-#endif
-
 namespace nca {
+
+constexpr u32 HeaderMagic = 0x3341434E;
 
 enum ContentType {
     ContentType_Program = 0x0,
@@ -34,8 +32,8 @@ enum DistributionType {
 };
 
 struct SectionTableEntry {
-    u32 media_start_offset; // divided by 0x200
-    u32 media_end_offset;   // divided by 0x200
+    u32 media_start_offset; // 0x200-byte units
+    u32 media_end_offset;   // 0x200-byte units
     u8 _0x8[0x4];
     u8 _0xC[0x4];
 };
@@ -108,16 +106,16 @@ struct CompressionInfo {
 static_assert(sizeof(CompressionInfo) == 0x28);
 
 struct FsHeader {
-    u16 version;        // always 2
-    u8 fs_type;         // FileSystemType
-    u8 hash_type;       // HashType
-    u8 encryption_type; // EncryptionType
+    u16 version;
+    u8 fs_type;
+    u8 hash_type;
+    u8 encryption_type;
     u8 metadata_hash_type;
     u8 _0x6[0x2];
 
     union {
         HierarchicalSha256Data hierarchical_sha256_data;
-        IntegrityMetaInfo integrity_meta_info; // romfs
+        IntegrityMetaInfo integrity_meta_info;
     } hash_data;
 
     PatchInfo patch_info;
@@ -253,7 +251,7 @@ struct NcmContentMetaData {
     NcmContentInfo infos[3];
 };
 
-// ncm content storage record (libnx doesn't expose this one).
+// libnx does not expose this NCM record.
 struct FwdContentStorageRecord {
     NcmContentMetaKey key;
     u8 storage_id;

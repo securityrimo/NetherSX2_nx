@@ -13,11 +13,13 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	$(notdir $(CURDIR))
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.0.1
+APP_VERSION	:=	1.1.0
 BUILD		:=	build
-SOURCES		:=	source source/hooks
+SOURCES		:=	source source/hooks source/switch
 DATA		:=	data
-INCLUDES	:=	source
+INCLUDES	:=	source source/switch \
+			launcher/dependencies/build/_deps/libsmb2-src/include \
+			launcher/dependencies/build/_deps/libusbhsfs-src/include
 
 #---------------------------------------------------------------------------------
 # options for code generation
@@ -39,13 +41,16 @@ else
 DEFINES	+=	-DGS_RENDERER=12
 endif
 
-CFLAGS	:=	-g -Wall -O2 -ffunction-sections -fno-omit-frame-pointer \
+CFLAGS	:=	-g -Wall -O3 -ffunction-sections -fno-omit-frame-pointer \
 			$(ARCH) $(DEFINES)
 CFLAGS	+=	$(INCLUDE)
 CXXFLAGS	:= $(CFLAGS)
 
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
+
+STORAGE_LIBS := $(TOPDIR)/launcher/dependencies/build/_deps/libsmb2-build/lib/libsmb2.a \
+				$(TOPDIR)/launcher/dependencies/build/_deps/libusbhsfs-build/liblibusbhsfs.a
 
 # nx: libnx (audren for the AAudio shim, HID, applet, fs). m: libm. No SDL2/
 # OpenSL ES -- audio is the in-tree AAudio->audren shim (source/aaudio.c).
@@ -65,11 +70,11 @@ LIBS	:= -Wl,--start-group \
 		-l:libnouveau_ws.a -l:libnvidia_headers_c.a \
 		-l:libnir.a -l:libcompiler.a -l:libcompiler_c_helpers.a \
 		-l:libmesa_util.a -l:libmesa_util_simd.a -l:libblake3.a -l:libmesa_util_c11.a \
-		-Wl,--end-group -lz -lzstd -lnx -lstdc++ -lm
+		-Wl,--end-group $(STORAGE_LIBS) -lz -lzstd -lnx -lstdc++ -lm
 else
 # EGL/GLESv2/glapi/drm_nouveau: switch-mesa/nouveau GL.
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)
-LIBS	:= -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lnx -lm
+LIBS	:= $(STORAGE_LIBS) -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lnx -lm
 endif
 
 #---------------------------------------------------------------------------------

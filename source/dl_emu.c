@@ -31,7 +31,7 @@ static int dl_err_set = 0;
 
 void *dlopen_fake(const char *filename, int flags) {
   (void)flags;
-  debugPrintf("dlopen(%s) -> pseudo handle\n", filename ? filename : "(self)");
+
   dl_err_set = 0;
   // any name (libEGL.so, libaaudio.so, self) -> the same pseudo handle; dlsym
   // searches the import table + module exports regardless of which lib was asked
@@ -59,7 +59,7 @@ void *dlsym_fake(void *handle, const char *symbol) {
 
   snprintf(dl_err, sizeof(dl_err), "undefined symbol: %s", symbol);
   dl_err_set = 1;
-  debugPrintf("dlsym(%s) -> NULL\n", symbol);
+
   return NULL;
 }
 

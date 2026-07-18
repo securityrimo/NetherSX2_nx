@@ -104,9 +104,6 @@ int fh_open_fd(const char *path, const char *mode) {
     return -1;
   int flags = mode_to_oflags(mode);
   int fd = open(path, flags, 0644);
-  if (fd < 0)
-    debugPrintf("fh_open_fd: open(%s, %s) failed: %s\n",
-                path, mode ? mode : "(null)", strerror(errno));
   return fd;
 }
 
@@ -140,7 +137,7 @@ static void find_walk(const char *root, const char *dir, int flags,
                       void ***items, int *count, int *cap) {
   DIR *d = opendir(dir);
   if (!d) {
-    debugPrintf("fh_find_files: opendir(%s) failed: %s\n", dir, strerror(errno));
+
     return;
   }
 
@@ -213,8 +210,7 @@ void *fh_find_files(const char *path, int flags) {
     jni_obj_array_set(arr, i, items[i]);
   free(items);
 
-  debugPrintf("fh_find_files(%s, %d) -> %d entries\n",
-              path ? path : "(null)", flags, count);
+
   return arr;
 }
 
@@ -234,7 +230,7 @@ static void *read_package_buf(const char *relpath, long *out_len) {
 
   FILE *f = fopen(full, "rb");
   if (!f) {
-    debugPrintf("read_package: fopen(%s) failed: %s\n", full, strerror(errno));
+
     return NULL;
   }
 
@@ -259,7 +255,7 @@ static void *read_package_buf(const char *relpath, long *out_len) {
   size_t got = fread(buf, 1, (size_t)len, f);
   fclose(f);
   if (got != (size_t)len) {
-    debugPrintf("read_package: short read on %s (%zu/%ld)\n", full, got, len);
+
     free(buf);
     return NULL;
   }

@@ -31,6 +31,7 @@ const char *jni_string_utf(void *jstr);           // fake jstring -> utf8 (or NU
 void *jni_obj_new(const char *clsname);           // empty fake object tagged with class
 void  jni_obj_set_long  (void *obj, const char *field, int64_t v);
 void  jni_obj_set_int   (void *obj, const char *field, int32_t v);
+int32_t jni_obj_get_int (void *obj, const char *field, int32_t def);
 void  jni_obj_set_float (void *obj, const char *field, float v);
 void  jni_obj_set_bool  (void *obj, const char *field, int v);
 void  jni_obj_set_string(void *obj, const char *field, const char *utf);

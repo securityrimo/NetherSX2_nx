@@ -1,23 +1,4 @@
-/* exc_entry.s -- custom libnx exception entry with RESUME support.
- *
- * libnx's stock __libnx_exception_entry is CRASH-ONLY: it copies the kernel's
- * TLS exception frame into the __nx_exceptiondump global, calls the C handler,
- * and svcBreak()s the instant that handler RETURNS (see exception.s: the
- * returnentry is `bl __libnx_exception_handler; ...; bl svcBreak`). There is no
- * resume-on-return. That is exactly why the JIT write-redirect died on its first
- * codegen fault: the fast path handled the store and `return`ed -> svcBreak.
- *
- * To actually resume, the handler must write the new PC (and any changed GPRs)
- * into the *kernel* frame (x1 on entry, a ThreadExceptionFrameA64) and call
- * svcReturnFromException(0). __libnx_exception_entry is a WEAK symbol, so we
- * override it here: build a full ThreadExceptionDump for the C dispatcher, and
- * on the resume path propagate its (modified) PC/GPRs back into the kernel frame
- * before svcReturnFromException. x9..x28/x29 are NOT in the kernel frame and the
- * kernel restores them from the live CPU on resume (libnx's own entry restores
- * them before its redirecting svcReturnFromException), so we reload them live.
- */
-
-/* ThreadExceptionDump (g_exc) field offsets -- must match libnx thread_context.h */
+/* ThreadExceptionDump offsets from libnx thread_context.h. */
 .equ D_ERR,    0x000
 .equ D_X0,     0x010      /* cpu_gprs[0]  (CpuRegister = 8 bytes) */
 .equ D_X9,     0x058      /* cpu_gprs[9]  = 0x010 + 9*8 */
@@ -29,8 +10,15 @@
 .equ D_PSTATE, 0x320
 .equ D_ESR,    0x32C
 .equ D_FAR,    0x330
+.equ D_SLOT_FRAME, 0x3E8
+.equ D_SLOT_INDEX, 0x3F0
+.equ D_SLOT_DEFERRED, 0x3E0
+.equ D_SLOT_RESULT, 0x3E4
+.equ D_SLOT_SHIFT, 10
+.equ D_STACK_SHIFT, 16
+.equ D_SLOT_MASK, 0xFF
 
-/* ThreadExceptionFrameA64 (kernel TLS frame, x1) field offsets */
+/* ThreadExceptionFrameA64 offsets. */
 .equ F_X0,     0x00       /* cpu_gprs[0..8] */
 .equ F_LR,     0x48
 .equ F_SP,     0x50
@@ -46,12 +34,35 @@
 __libnx_exception_entry:
     /* x0 = error_desc, x1 = kernel exception frame (== SP on entry) */
 
-    /* ---- capture the full faulting context into g_exc ---- */
-    adrp x2, g_exc
-    add  x2, x2, :lo12:g_exc
+    /* Reserve a context for this fault. */
+    adrp x6, g_exc_slot_mask
+    add  x6, x6, :lo12:g_exc_slot_mask
+1:
+    ldaxr w2, [x6]
+    mvn   w3, w2
+    and   w3, w3, #D_SLOT_MASK
+    cbnz  w3, 2f
+    yield
+    b     1b
+2:
+    rbit  w4, w3
+    clz   w4, w4
+    mov   w5, #1
+    lsl   w5, w5, w4
+    orr   w3, w2, w5
+    stxr  w7, w3, [x6]
+    cbnz  w7, 1b
+
+    adrp x2, g_exc_slots
+    add  x2, x2, :lo12:g_exc_slots
+    add  x2, x2, x4, lsl #D_SLOT_SHIFT
+    str  x1, [x2, #D_SLOT_FRAME]
+    str  w4, [x2, #D_SLOT_INDEX]
+    str  wzr, [x2, #D_SLOT_DEFERRED]
+    str  wzr, [x2, #D_SLOT_RESULT]
+
     str  w0, [x2, #D_ERR]
 
-    /* live x9..x28 -> g_exc.cpu_gprs[9..28] (not in the kernel frame; save first) */
     add  x3, x2, #D_X9
     stp  x9,  x10, [x3], #16
     stp  x11, x12, [x3], #16
@@ -63,9 +74,8 @@ __libnx_exception_entry:
     stp  x23, x24, [x3], #16
     stp  x25, x26, [x3], #16
     stp  x27, x28, [x3], #16
-    str  x29, [x2, #D_FP]           /* live fp (x29) */
+    str  x29, [x2, #D_FP]
 
-    /* frame x0..x8 -> g_exc.cpu_gprs[0..8] */
     add  x3, x2, #D_X0
     ldp  x4, x5, [x1, #F_X0+0x00]
     stp  x4, x5, [x3], #16
@@ -75,17 +85,15 @@ __libnx_exception_entry:
     stp  x4, x5, [x3], #16
     ldp  x4, x5, [x1, #F_X0+0x30]
     stp  x4, x5, [x3], #16
-    ldr  x4, [x1, #F_X0+0x40]       /* x8 */
+    ldr  x4, [x1, #F_X0+0x40]
     str  x4, [x3]
 
-    /* frame lr/sp/elr -> g_exc */
     ldr  x4, [x1, #F_LR]
     str  x4, [x2, #D_LR]
     ldr  x4, [x1, #F_SP]
     str  x4, [x2, #D_SP]
     ldr  x4, [x1, #F_ELR]
     str  x4, [x2, #D_PC]
-    /* frame pstate/esr/far -> g_exc */
     ldr  w4, [x1, #F_PSTATE]
     str  w4, [x2, #D_PSTATE]
     ldr  w4, [x1, #F_ESR]
@@ -93,7 +101,6 @@ __libnx_exception_entry:
     ldr  x4, [x1, #F_FAR]
     str  x4, [x2, #D_FAR]
 
-    /* live SIMD q0..q31 -> g_exc.fpu_gprs (decoder needs these for SIMD stores) */
     add  x3, x2, #D_FPU
     stp  q0,  q1,  [x3], #32
     stp  q2,  q3,  [x3], #32
@@ -112,32 +119,22 @@ __libnx_exception_entry:
     stp  q28, q29, [x3], #32
     stp  q30, q31, [x3], #32
 
-    /* stash the kernel frame pointer for the resume path */
-    adrp x3, g_exc_frame
-    str  x1, [x3, :lo12:g_exc_frame]
-
-    /* switch to the dedicated exception stack */
     adrp x4, __nx_exception_stack
     add  x4, x4, :lo12:__nx_exception_stack
-    adrp x5, __nx_exception_stack_size
-    ldr  x5, [x5, :lo12:__nx_exception_stack_size]
-    add  x4, x4, x5
+    ldr  w5, [x2, #D_SLOT_INDEX]
+    add  x4, x4, x5, lsl #D_STACK_SHIFT
+    add  x4, x4, #0x10, lsl #12
     mov  sp, x4
+    sub  sp, sp, #16
+    str  x2, [sp]
 
-    /* Dispatch in C: __libnx_exception_handler(&g_exc). It RETURNS only when the
-     * fault was a handled codegen store (resume); a real crash logs +
-     * svcExitProcess() and never comes back. */
-    adrp x0, g_exc
-    add  x0, x0, :lo12:g_exc
+    mov  x0, x2
     bl   __libnx_exception_handler
 
-    /* ---- resume: write the (possibly modified) context back to the frame ---- */
-    adrp x2, g_exc
-    add  x2, x2, :lo12:g_exc
-    adrp x3, g_exc_frame
-    ldr  x1, [x3, :lo12:g_exc_frame]
+    ldr  x2, [sp]
+    add  sp, sp, #16
+    ldr  x1, [x2, #D_SLOT_FRAME]
 
-    /* g_exc x0..x8 -> frame */
     add  x3, x2, #D_X0
     ldp  x4, x5, [x3], #16
     stp  x4, x5, [x1, #F_X0+0x00]
@@ -149,7 +146,6 @@ __libnx_exception_entry:
     stp  x4, x5, [x1, #F_X0+0x30]
     ldr  x4, [x3]
     str  x4, [x1, #F_X0+0x40]
-    /* g_exc lr/sp/pc -> frame (pc = skip-PC set by the decoder) */
     ldr  x4, [x2, #D_LR]
     str  x4, [x1, #F_LR]
     ldr  x4, [x2, #D_SP]
@@ -157,7 +153,6 @@ __libnx_exception_entry:
     ldr  x4, [x2, #D_PC]
     str  x4, [x1, #F_ELR]
 
-    /* restore live x9..x28, fp (kernel resumes these from the live CPU) */
     add  x3, x2, #D_X9
     ldp  x9,  x10, [x3], #16
     ldp  x11, x12, [x3], #16
@@ -171,8 +166,6 @@ __libnx_exception_entry:
     ldp  x27, x28, [x3], #16
     ldr  x29, [x2, #D_FP]
 
-    /* restore live SIMD q0..q31 -- the C handler (memcpy etc.) may have trashed
-     * caller-saved vectors, and the kernel resumes SIMD from the live CPU. */
     add  x3, x2, #D_FPU
     ldp  q0,  q1,  [x3], #32
     ldp  q2,  q3,  [x3], #32
@@ -191,8 +184,40 @@ __libnx_exception_entry:
     ldp  q28, q29, [x3], #32
     ldp  q30, q31, [x3], #32
 
-    /* svcReturnFromException(0): kernel eret's using the modified frame */
+    ldr  w8, [x2, #D_SLOT_DEFERRED]
+    cbnz w8, 4f
+
+    ldr  w4, [x2, #D_SLOT_INDEX]
+    mov  w5, #1
+    lsl  w5, w5, w4
+    mvn  w5, w5
+    adrp x6, g_exc_slot_mask
+    add  x6, x6, :lo12:g_exc_slot_mask
+3:
+    ldaxr w3, [x6]
+    and   w3, w3, w5
+    stlxr w7, w3, [x6]
+    cbnz  w7, 3b
+
+4:
     mov  w0, wzr
     svc  #0x28
     brk  #0                         /* unreachable */
 .size __libnx_exception_entry, . - __libnx_exception_entry
+
+.global fastmem_fault_trampoline
+.type fastmem_fault_trampoline, %function
+.align 2
+fastmem_fault_trampoline:
+    mov  x19, x0
+    bl   fastmem_run_deferred_fault
+    str  w0, [x19, #D_SLOT_RESULT]
+    mov  x0, xzr
+
+.global fastmem_fault_resume_marker
+.type fastmem_fault_resume_marker, %function
+.size fastmem_fault_trampoline, . - fastmem_fault_trampoline
+fastmem_fault_resume_marker:
+    ldr  x0, [x0]
+    b    fastmem_fault_resume_marker
+.size fastmem_fault_resume_marker, . - fastmem_fault_resume_marker

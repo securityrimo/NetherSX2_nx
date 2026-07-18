@@ -1,16 +1,5 @@
 /* jni_fake.c -- fake JNI environment for libemucore.so
  *
- * libemucore.so (AetherSX2/PCSX2 lineage) drives a Java frontend we replace
- * natively. The core caches FindClass/GetMethodID/GetStaticMethodID/GetFieldID
- * cookies once at init, then talks to four surfaces through Call*Method/Get*Field:
- *   - FileHelper            -> filehelper.c (SAF file IO; mostly dormant)
- *   - PreferenceHelpers + SharedPreferences(+$Editor) -> prefs.c (settings store)
- *   - NativeLibrary static callbacks (OSD/asset/vibration) -> stubs here
- *   - Bitmap / Build / result classes -> stubs here
- * We intern (name,sig) lookups into FakeID cookies and dispatch Call*Method by
- * NAME; Get*Field reads typed fields off the fake objects built via jni_obj_*.
- * Signatures/contract are from jni_callback_contract.md (Parts A and C).
- *
  * This software may be modified and distributed under the terms
  * of the MIT license.  See the LICENSE file for details.
  */
@@ -23,42 +12,10 @@
 
 #include "config.h"
 #include "util.h"
-#include "so_util.h"
 #include "jni_fake.h"
 #include "prefs.h"
 #include "filehelper.h"
 #include "cert_data.h"
-
-extern so_module emu_mod; // libemucore.so (main.c) -- for emucore-offset in JNI caller logs
-
-// Per-call JNI dispatch tracing. The core queries settings (contains/getBoolean/
-// getString) thousands of times per applySettings, so tracing every call floods
-// the log (~3000 lines/boot) and each SD-flushed debugPrintf drags the emulated
-// boot. Default OFF; flip to 1 to rediscover the JNI call sequence. Unhandled-
-// method fallbacks below stay unconditional -- those are rare and flag real gaps.
-static int jni_trace = 0;
-#define JTRACE(...) do { if (jni_trace) debugPrintf(__VA_ARGS__); } while (0)
-
-// walk the AArch64 frame-pointer chain (x29) and log every return address that
-// lands inside libemucore.so -- the full emucore call stack for this JNI call.
-// More robust than __builtin_return_address(N) across the varargs JNI thunks.
-static void jni_log_stack(const char *what) {
-  uintptr_t fp;
-  __asm__ volatile ("mov %0, x29" : "=r"(fp));
-  uintptr_t base = (uintptr_t)emu_mod.load_virtbase, end = base + emu_mod.load_size;
-  char buf[320]; int n = 0;
-  n += snprintf(buf + n, sizeof(buf) - n, "JNI: %s emucore stack:", what);
-  uintptr_t *f = (uintptr_t *)fp;
-  for (int i = 0; i < 10 && (uintptr_t)f > 0x10000; i++) {
-    uintptr_t ra = f[1];                       // [fp+8] = saved LR (return addr)
-    if (ra >= base && ra < end && n < (int)sizeof(buf) - 16)
-      n += snprintf(buf + n, sizeof(buf) - n, " +0x%lx", (unsigned long)(ra - base));
-    uintptr_t next = f[0];                      // [fp] = caller fp
-    if (next <= (uintptr_t)f) break;            // must move up the stack
-    f = (uintptr_t *)next;
-  }
-  debugPrintf("%s\n", buf);
-}
 
 #define JNI_OK 0
 #define JNI_VERSION_1_6 0x00010006
@@ -131,42 +88,20 @@ typedef struct {
 // object builders (jni_fake.h public API)
 // ---------------------------------------------------------------------------
 
-// allocation accounting + a one-shot heap probe so an allocation failure prints
-// WHY (heap exhausted vs fragmented) instead of a blind Data Abort at NULL.
-static unsigned long g_jni_allocs = 0;
 static FakeObject g_oom_obj;
 static FakeString g_oom_str;
-
-static void jni_report_oom(const char *what, size_t want) {
-  static int once = 0;
-  debugPrintf("JNI: *** alloc FAILED in %s (want %lu B) after %lu jni allocs ***\n",
-              what, (unsigned long)want, g_jni_allocs);
-  if (!once) {
-    once = 1;
-    extern long jit_mmap_total_kb(void); // libc_shim.c: bytes handed to the core via mmap
-    debugPrintf("JNI: mmap_fake has handed the core %ld KB so far\n", jit_mmap_total_kb());
-    for (size_t t = 0x1000; t <= ((size_t)1 << 31); t <<= 3) {
-      void *x = malloc(t);
-      debugPrintf("JNI: heap probe malloc(%lu KB) = %s\n",
-                  (unsigned long)(t / 1024), x ? "ok" : "FAIL");
-      free(x);
-    }
-  }
-}
 
 void *jni_make_object(const char *label) {
   FakeObject *o = calloc(1, sizeof(*o));
   if (!o) {
-    jni_report_oom("jni_make_object", sizeof(*o));
     g_oom_obj.tag = TAG_OBJECT; g_oom_obj.nfields = 0; g_oom_obj.label[0] = '\0';
-    return &g_oom_obj; // safe fallback; never deref NULL
+    return &g_oom_obj;
   }
-  g_jni_allocs++;
   o->tag = TAG_OBJECT;
   if (label) {
     size_t n = strnlen(label, sizeof(o->label) - 1);
     memcpy(o->label, label, n);
-    o->label[n] = '\0'; // (calloc already zeroed; explicit for clarity)
+    o->label[n] = '\0';
   }
   return o;
 }
@@ -178,11 +113,9 @@ void *jni_obj_new(const char *clsname) {
 void *jni_make_string(const char *utf) {
   FakeString *s = calloc(1, sizeof(*s));
   if (!s) {
-    jni_report_oom("jni_make_string", sizeof(*s));
     g_oom_str.tag = TAG_STRING; g_oom_str.utf = "";
     return &g_oom_str;
   }
-  g_jni_allocs++;
   s->tag = TAG_STRING;
   s->utf = strdup(utf ? utf : "");
   return s;
@@ -209,7 +142,7 @@ static FakeField *obj_field(FakeObject *o, const char *field) {
     if (!strcmp(o->fields[i].name, field))
       return &o->fields[i];
   if (o->nfields >= MAX_FIELDS) {
-    debugPrintf("JNI: object field overflow on %s.%s\n", o->label, field);
+
     return &o->fields[MAX_FIELDS - 1];
   }
   FakeField *fld = &o->fields[o->nfields++];
@@ -224,6 +157,10 @@ void jni_obj_set_long(void *obj, const char *field, int64_t v) {
 void jni_obj_set_int(void *obj, const char *field, int32_t v) {
   FakeField *f = obj_field(obj, field);
   if (f) { f->type = 'I'; f->v.i = v; }
+}
+int32_t jni_obj_get_int(void *obj, const char *field, int32_t def) {
+  FakeField *f = obj_field(obj, field);
+  return f && (f->type == 'I' || f->type == 'Z') ? f->v.i : def;
 }
 void jni_obj_set_float(void *obj, const char *field, float v) {
   FakeField *f = obj_field(obj, field);
@@ -244,12 +181,11 @@ void jni_obj_set_object(void *obj, const char *field, void *child) {
 
 void *jni_make_byte_array(const void *data, int len) {
   FakeByteArray *a = calloc(1, sizeof(*a));
-  if (!a) { jni_report_oom("jni_make_byte_array", sizeof(*a)); return NULL; }
-  g_jni_allocs++;
+  if (!a) return NULL;
   a->tag = TAG_BYTARR;
   a->len = len < 0 ? 0 : len;
   a->data = calloc(a->len ? a->len : 1, 1);
-  if (!a->data) { jni_report_oom("jni_make_byte_array.data", a->len); a->len = 0; return a; }
+  if (!a->data) { a->len = 0; return a; }
   if (data && a->len)
     memcpy(a->data, data, a->len);
   return a;
@@ -257,12 +193,11 @@ void *jni_make_byte_array(const void *data, int len) {
 
 void *jni_make_object_array(int n) {
   FakeObjArray *a = calloc(1, sizeof(*a));
-  if (!a) { jni_report_oom("jni_make_object_array", sizeof(*a)); return NULL; }
-  g_jni_allocs++;
+  if (!a) return NULL;
   a->tag = TAG_OBJARR;
   a->len = n < 0 ? 0 : n;
   a->items = calloc(a->len ? a->len : 1, sizeof(void *));
-  if (!a->items) { jni_report_oom("jni_make_object_array.items", a->len); a->len = 0; }
+  if (!a->items) a->len = 0;
   return a;
 }
 
@@ -298,7 +233,7 @@ static FakeID *get_id(const char *name, const char *sig) {
     if (!strcmp(id_pool[i].name, name) && !strcmp(id_pool[i].sig, sig))
       return &id_pool[i];
   if (id_count >= MAX_IDS) {
-    debugPrintf("JNI: id pool exhausted! (%s %s)\n", name, sig);
+
     return &id_pool[0];
   }
   FakeID *id = &id_pool[id_count++];
@@ -387,13 +322,13 @@ static void *stringset_for_key(const char *key) {
 
 // -- boolean-returning calls --------------------------------------------------
 static juint dispatch_boolean(const char *name, va_list va) {
-  JTRACE("JNI: call %s (bool)\n", name);
+
   // SharedPreferences.contains(key)
   if (!strcmp(name, "contains")) {
     void *jkey = va_arg(va, void *);
     const char *k = obj_str(jkey);
     int r = prefs_contains(k) ? 1 : 0;
-    JTRACE("JNI:   contains('%s') -> %d\n", k ? k : "(null)", r);
+
     return r;
   }
   // SharedPreferences.getBoolean(key, default)
@@ -402,7 +337,7 @@ static juint dispatch_boolean(const char *name, va_list va) {
     int def = va_arg(va, int);           // jboolean widens to int
     const char *k = obj_str(jkey);
     int r = prefs_get_bool(k, def ? true : false) ? 1 : 0;
-    JTRACE("JNI:   getBoolean('%s', %d) -> %d\n", k ? k : "(null)", def, r);
+
     return r;
   }
   // Editor.commit() / apply() -> flush, true
@@ -425,13 +360,13 @@ static juint dispatch_boolean(const char *name, va_list va) {
   // URLDownloader.get/post -> no network
   if (!strcmp(name, "get") || !strcmp(name, "post"))
     return 0;
-  debugPrintf("JNI: CallBoolean(%s) -> false\n", name);
+
   return 0;
 }
 
 // -- int-returning calls ------------------------------------------------------
 static juint dispatch_int(const char *name, va_list va) {
-  JTRACE("JNI: call %s (int)\n", name);
+
   // SharedPreferences.getInt(key, default)
   if (!strcmp(name, "getInt")) {
     void *jkey = va_arg(va, void *);
@@ -447,24 +382,24 @@ static juint dispatch_int(const char *name, va_list va) {
   // URLDownloader.getStatusCode() -> nothing fetched
   if (!strcmp(name, "getStatusCode"))
     return 0;
-  debugPrintf("JNI: CallInt(%s) -> 0\n", name);
+
   return 0;
 }
 
 // -- long-returning calls -----------------------------------------------------
 static int64_t dispatch_long(const char *name, va_list va) {
-  JTRACE("JNI: call %s (long)\n", name);
+
   (void)va;
   // PackageInfo.getLongVersionCode() (API 28+)
   if (!strcmp(name, "getLongVersionCode"))
     return 4248;
-  debugPrintf("JNI: CallLong(%s) -> 0\n", name);
+
   return 0;
 }
 
 // -- float-returning calls ----------------------------------------------------
 static float dispatch_float(const char *name, va_list va) {
-  JTRACE("JNI: call %s (float)\n", name);
+
   // SharedPreferences.getFloat(key, default)
   if (!strcmp(name, "getFloat")) {
     void *jkey = va_arg(va, void *);
@@ -474,7 +409,7 @@ static float dispatch_float(const char *name, va_list va) {
   // Display.getRefreshRate() -> Hz (we present at 60)
   if (!strcmp(name, "getRefreshRate"))
     return 60.0f;
-  debugPrintf("JNI: CallFloat(%s) -> 0\n", name);
+
   return 0.0f;
 }
 
@@ -482,7 +417,7 @@ static float dispatch_float(const char *name, va_list va) {
 // `recv` is the receiver object/class (needed only for Set.toArray, whose
 // backing array is stashed on the Set we built); NULL for static calls.
 static void *dispatch_object(void *recv, const char *name, const char *sig, va_list va) {
-  JTRACE("JNI: call %s %s (obj)\n", name, sig ? sig : "");
+
   // PreferenceHelpers.getDefaultSharedPreferences(ctx) -> the singleton
   if (!strcmp(name, "getDefaultSharedPreferences"))
     return get_prefs_obj();
@@ -530,7 +465,7 @@ static void *dispatch_object(void *recv, const char *name, const char *sig, va_l
       void *jdef = va_arg(va, void *);
       const char *k = obj_str(jkey);
       const char *v = prefs_get_string(k, jdef ? jni_string_utf(jdef) : NULL);
-      JTRACE("JNI:   getString('%s') -> '%s'\n", k ? k : "(null)", v ? v : "(null)");
+
       return v ? jni_make_string(v) : NULL;
     }
     return jni_make_string(""); // resource-string overload: no resources here
@@ -689,24 +624,21 @@ static void *dispatch_object(void *recv, const char *name, const char *sig, va_l
     size_t n = 0;
     for (; lbl[n] && n < sizeof(dotted) - 1; n++) dotted[n] = (lbl[n] == '/') ? '.' : lbl[n];
     dotted[n] = '\0';
-    debugPrintf("JNI:   getName() -> '%s'\n", dotted);
+
     return jni_make_string(dotted);
   }
 
-  debugPrintf("JNI: CallObject(%s) -> null\n", name);
+
   return NULL;
 }
 
-extern void wrapper_rumble(float large, float small); // main.c: HD rumble driver
+extern void wrapper_rumble(int player, float large, float small);
 
 // -- void-returning calls -----------------------------------------------------
 static void dispatch_void(const char *name, va_list va) {
-  JTRACE("JNI: call %s (void)\n", name);
+
   // NativeLibrary lifecycle no-ops (we drive the VM natively). Log the VM
-  // start/stop milestones explicitly (one-time; the generic dispatch trace is
-  // gated) so the boot timeline is visible without the JNI flood.
   if (!strcmp(name, "onVMStarting") || !strcmp(name, "onVMStarted")) {
-    debugPrintf("JNI: %s\n", name);
     return;
   }
   if (!strcmp(name, "showPauseMenu"))
@@ -715,34 +647,31 @@ static void dispatch_void(const char *name, va_list va) {
   // NativeLibrary.onGameChanged(path, serial, title, crc)
   if (!strcmp(name, "onGameChanged")) {
     void *jpath = va_arg(va, void *); (void)jpath;
-    void *jser  = va_arg(va, void *);
-    void *jtit  = va_arg(va, void *);
-    int crc = va_arg(va, int);
-    debugPrintf("JNI: onGameChanged serial=%s title=%s crc=%08x\n",
-                obj_str(jser), obj_str(jtit), (unsigned)crc);
+    (void)va_arg(va, void *);
+    (void)va_arg(va, void *);
+    (void)va_arg(va, int);
     return;
   }
   // NativeLibrary.reportErrorAsync(title, msg)
   if (!strcmp(name, "reportErrorAsync")) {
-    void *jtit = va_arg(va, void *);
-    void *jmsg = va_arg(va, void *);
-    debugPrintf("JNI: reportError [%s] %s\n", obj_str(jtit), obj_str(jmsg));
+    (void)va_arg(va, void *);
+    (void)va_arg(va, void *);
     return;
   }
   // rumble -> Switch HD rumble. setVibratorIntensity(Vibrator, int);
   // setManagedVibratorIntensity(manager, v1, i1, v2, i2). Intensity is 0-255.
   if (!strcmp(name, "setVibratorIntensity")) {
-    va_arg(va, void *);                            // Vibrator (opaque)
+    void *vibrator = va_arg(va, void *);
     int intensity = va_arg(va, int);
-    static int n = 0; if (n++ < 8) debugPrintf("JNI: setVibratorIntensity(%d)\n", intensity);
-    wrapper_rumble(intensity / 255.0f, intensity / 255.0f);
+    wrapper_rumble(jni_obj_get_int(vibrator, "player", 0),
+                   intensity / 255.0f, intensity / 255.0f);
     return;
   }
   if (!strcmp(name, "setManagedVibratorIntensity")) {
     va_arg(va, void *);                            // VibratorManager
     va_arg(va, void *); int i1 = va_arg(va, int);  // large motor
     va_arg(va, void *); int i2 = va_arg(va, int);  // small motor
-    wrapper_rumble(i1 / 255.0f, i2 / 255.0f);
+    wrapper_rumble(0, i1 / 255.0f, i2 / 255.0f);
     return;
   }
 
@@ -750,7 +679,7 @@ static void dispatch_void(const char *name, va_list va) {
   if (!strcmp(name, "clearSection")) {
     va_arg(va, void *);                  // prefs handle
     void *jsec = va_arg(va, void *);
-    debugPrintf("JNI: clearSection(%s)\n", obj_str(jsec));
+
     // best-effort: clear the list bucket if it exists under this name
     prefs_remove(obj_str(jsec));
     return;
@@ -781,7 +710,7 @@ static void dispatch_void(const char *name, va_list va) {
       !strcmp(name, "modalError"))
     return;
 
-  debugPrintf("JNI: CallVoid(%s) ignored\n", name);
+
 }
 
 // ---------------------------------------------------------------------------
@@ -805,14 +734,14 @@ static juint field_int(void *obj, const char *name) {
   // Build$VERSION.SDK_INT is read via GetStaticIntField with this name
   if (!strcmp(name, "SDK_INT"))
     return ANDROID_SDK_INT;
-  debugPrintf("JNI: GetIntField(%s) -> 0\n", name);
+
   return 0;
 }
 
 static int64_t field_long(void *obj, const char *name) {
   FakeField *f = find_field(obj, name);
   if (f) return f->type == 'J' ? f->v.j : (int64_t)f->v.i;
-  debugPrintf("JNI: GetLongField(%s) -> 0\n", name);
+
   return 0;
 }
 
@@ -834,7 +763,7 @@ static void *field_object(void *obj, const char *name) {
     return f->v.o;
   if (!strcmp(name, "SDK_INT"))
     return NULL;
-  debugPrintf("JNI: GetObjectField(%s) -> null\n", name);
+
   return NULL;
 }
 
@@ -847,25 +776,25 @@ static juint j_GetVersion(void *env) { (void)env; return JNI_VERSION_1_6; }
 
 static void *j_FindClass(void *env, const char *name) {
   (void)env;
-  debugPrintf("JNI: FindClass(%s)\n", name);
+
   return jni_make_object(name);
 }
 
 static void *j_GetMethodID(void *env, void *cls, const char *name, const char *sig) {
   (void)env; (void)cls;
-  debugPrintf("JNI: GetMethodID(%s %s)\n", name, sig);
+
   return get_id(name, sig);
 }
 
 static void *j_GetFieldID(void *env, void *cls, const char *name, const char *sig) {
   (void)env; (void)cls;
-  debugPrintf("JNI: GetFieldID(%s %s)\n", name, sig);
+
   return get_id(name, sig);
 }
 
 static void *j_GetObjectClass(void *env, void *obj) {
   (void)env;
-  debugPrintf("JNI: GetObjectClass(%p) [jni allocs=%lu]\n", obj, g_jni_allocs);
+
   FakeObject *o = obj;
   return jni_make_object((o && o->tag == TAG_OBJECT) ? o->label : "class");
 }
@@ -907,13 +836,9 @@ static juint j_CallBooleanMethod(void *env, void *obj, FakeID *id, ...) {
 }
 static void *j_CallObjectMethodV(void *env, void *obj, FakeID *id, va_list va) {
   (void)env;
-  if (id && !strcmp(id->name, "getName"))
-    jni_log_stack("getName");
   return dispatch_object(obj, id->name, id->sig, va);
 }
 static void *j_CallObjectMethod(void *env, void *obj, FakeID *id, ...) {
-  if (id && !strcmp(id->name, "getName"))
-    jni_log_stack("getName");
   va_list va; va_start(va, id);
   void *r = dispatch_object(obj, id->name, id->sig, va);
   va_end(va); return r;
@@ -1023,7 +948,7 @@ static juint j_GetStaticIntField(void *env, void *cls, FakeID *id) {
   (void)env; (void)cls;
   if (!strcmp(id->name, "SDK_INT"))
     return ANDROID_SDK_INT;
-  debugPrintf("JNI: GetStaticIntField(%s) -> 0\n", id->name);
+
   return 0;
 }
 static void *j_GetStaticObjectField(void *env, void *cls, FakeID *id) {
@@ -1037,7 +962,7 @@ static void *j_GetStaticObjectField(void *env, void *cls, FakeID *id) {
   if (!strcmp(id->name, "HARDWARE"))     return jni_make_string("nx");
   if (!strcmp(id->name, "FINGERPRINT"))  return jni_make_string("Nintendo/Switch/nx");
   if (!strcmp(id->name, "RELEASE"))      return jni_make_string("11"); // VERSION.RELEASE
-  debugPrintf("JNI: GetStaticObjectField(%s) -> null\n", id->name);
+
   return NULL;
 }
 
@@ -1110,7 +1035,7 @@ static void j_SetByteArrayRegion(void *env, void *arr, int start, int len, const
 // --- misc --------------------------------------------------------------------
 static juint j_RegisterNatives(void *env, void *cls, void *methods, int n) {
   (void)env; (void)cls; (void)methods;
-  debugPrintf("JNI: RegisterNatives(%d) ignored\n", n);
+
   return 0;
 }
 static juint j_GetJavaVM(void *env, void **vm) {
@@ -1124,7 +1049,7 @@ static juint j_PushLocalFrame(void *env, int cap) { (void)env; (void)cap; return
 static void *j_PopLocalFrame(void *env, void *result) { (void)env; return result; }
 
 static juint j_unimplemented(void) {
-  debugPrintf("JNI: call to unimplemented function slot\n");
+
   return 0;
 }
 
@@ -1236,5 +1161,5 @@ void jni_init(void) {
   vm_table[6] = (void *)vm_GetEnv;
   vm_table[7] = (void *)vm_AttachCurrentThread; // AttachCurrentThreadAsDaemon
 
-  debugPrintf("JNI: fake environment initialized (env=%p vm=%p)\n", fake_env, fake_vm);
+
 }

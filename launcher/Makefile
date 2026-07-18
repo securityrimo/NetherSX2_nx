@@ -15,32 +15,40 @@ include $(DEVKITPRO)/libnx/switch_rules
 
 TARGET		:=	NetherSX2
 BUILD		:=	build
-SOURCES		:=	source
+SOURCES		:=	source ../source/switch
 DATA		:=	data
-INCLUDES	:=	include
+INCLUDES	:=	include ../source/switch \
+			dependencies/build/_deps/libsmb2-src/include \
+			dependencies/build/_deps/libusbhsfs-src/include
 ROMFS		:=	romfs		# bundles the emulator cores (cores/emucore_*.so)
 
 APP_TITLE	:=	NetherSX2
 APP_AUTHOR	:=	naga
-APP_VERSION	:=	1.0.1
+APP_VERSION	:=	1.1.0
 
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
 PKGS	:=	sdl2 SDL2_ttf SDL2_image libcurl
 
-CFLAGS	:=	`$(PREFIX)pkg-config --cflags $(PKGS)` -Wall -O2 -ffunction-sections \
+CFLAGS	:=	`$(PREFIX)pkg-config --cflags $(PKGS)` -Wall -Wextra -O3 -DNDEBUG \
+			-ffunction-sections -fdata-sections -fno-ident \
+			-ffile-prefix-map=$(CURDIR)=. -fmacro-prefix-map=$(CURDIR)=. \
 			$(ARCH) $(DEFINES)
-CFLAGS	+=	$(INCLUDE) -D__SWITCH__
+CFLAGS	+=	$(INCLUDE) -D__SWITCH__ -D_GNU_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 \
+			-DNETHERSX2_VERSION='"$(APP_VERSION)"'
 
-CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
+CXXFLAGS	:= $(CFLAGS) -fno-rtti -std=gnu++17
 
-ASFLAGS	:=	-g $(ARCH)
-LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
+ASFLAGS	:=	$(ARCH)
+LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) -Wl,-Map,$(notdir $*.map) \
+			-Wl,--gc-sections -Wl,--build-id=none
 
 # SDL2_image (covers) + libcurl (SteamGridDB; libnx TLS backend, no cacert needed) +
 # turbojpeg (forwarder NACP icon encoding).
-LIBS	:=	`$(PREFIX)pkg-config --libs $(PKGS)` -lturbojpeg -lz -lGLESv2 -lnx
+STORAGE_LIBS := $(TOPDIR)/dependencies/build/_deps/libsmb2-build/lib/libsmb2.a \
+				$(TOPDIR)/dependencies/build/_deps/libusbhsfs-build/liblibusbhsfs.a
+LIBS	:=	$(STORAGE_LIBS) `$(PREFIX)pkg-config --libs $(PKGS)` -lturbojpeg -lz -lGLESv2 -lnx
 
 #---------------------------------------------------------------------------------
 LIBDIRS	:= $(PORTLIBS) $(LIBNX)
@@ -58,7 +66,7 @@ export VPATH	:=	$(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
 export DEPSDIR	:=	$(CURDIR)/$(BUILD)
 
 CFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
-CPPFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
+CPPFILES	:=	$(filter-out SwitchStorageBridge.cpp,$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp))))
 SFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
 BINFILES	:=	$(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
 

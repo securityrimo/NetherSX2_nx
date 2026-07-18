@@ -1,12 +1,4 @@
-/* aaudio.c -- NDK AAudio ABI shim backed by one libnx audren FLOAT voice.
- *
- * libemucore.so drives audio through AetherSX2's "AAudioMod" pull-callback
- * backend: it builds a stream (48000 / 2ch / PCM_FLOAT / LOW_LATENCY), then a
- * device thread repeatedly calls the registered data callback to FILL
- * interleaved stereo frames. We satisfy the ~19 imported symbols with a single
- * audren stereo float voice @ 48000 and a dedicated playback thread that pulls
- * from the core and feeds wavebufs. No conversion in the common path (audren
- * speaks float natively); an s16 fallback covers the case audren rejects FLOAT.
+/* aaudio.c -- NDK AAudio shim backed by libnx audren
  *
  * This software may be modified and distributed under the terms
  * of the MIT license.  See the LICENSE file for details.
@@ -22,13 +14,8 @@
 #include "pthr.h"
 #include "util.h"
 
-// One data-callback block size when the builder didn't pick one. 512 frames @
-// 48k float stereo is ~10.7 ms -- within LOW_LATENCY and a comfortable multiple
-// of the audren mix tick (~5 ms), so one pulled block spans ~2 audren frames.
 #define DEFAULT_FRAMES_PER_CB 512
 
-// Triple-buffer the wavebufs so the playback thread always has a free slot to
-// fill while audren consumes the others; double would stall on the boundary.
 #define NUM_WAVEBUFS 3
 
 // ---------------------------------------------------------------------------
@@ -82,11 +69,13 @@ struct AAudioStreamStruct {
   int                        thread_started;
   volatile int               running;
   volatile int               thread_exited;   // set by playback_thread before it returns
-  volatile int               in_data_cb;      // 1 while inside the core's data_cb
-  volatile int               thread_detached;  // stop had to abandon a wedged thread
+  volatile int               thread_detached;
+  volatile int               closing;
   volatile aaudio_stream_state_t state;
   volatile int64_t           frames_read;   // monotonic; AAudioStream_getFramesRead
   Mutex                      lock;           // guards state + cv
+  Mutex                      control_lock;
+  Mutex                      driver_lock;
   CondVar                    state_cv;       // signalled on every state change
 };
 
@@ -135,7 +124,7 @@ aaudio_result_t AAudio_createStreamBuilder(AAudioStreamBuilder **builder) {
   b->buffer_capacity_frames = 0;
   b->frames_per_cb = 0;  // 0 => we choose DEFAULT_FRAMES_PER_CB at openStream
   *builder = b;
-  debugPrintf("aaudio: createStreamBuilder %p\n", (void *)b);
+
   return AAUDIO_OK;
 }
 
@@ -183,14 +172,14 @@ static aaudio_result_t open_audren(AAudioStream *s) {
 
   rc = audrenInitialize(&k_audren_cfg);
   if (R_FAILED(rc)) {
-    debugPrintf("aaudio: audrenInitialize failed: 0x%x\n", rc);
+
     return map_result(rc);
   }
   s->audren_inited = 1;
 
   rc = audrvCreate(&s->drv, &k_audren_cfg, s->channel_count);
   if (R_FAILED(rc)) {
-    debugPrintf("aaudio: audrvCreate failed: 0x%x\n", rc);
+
     audrenExit();
     s->audren_inited = 0;
     return map_result(rc);
@@ -202,7 +191,7 @@ static aaudio_result_t open_audren(AAudioStream *s) {
   s->ring_bytes  = (s->block_bytes * NUM_WAVEBUFS + 0xFFF) & ~(size_t)0xFFF;
   s->ring = aligned_alloc(0x1000, s->ring_bytes);
   if (!s->ring) {
-    debugPrintf("aaudio: ring alloc (%zu) failed\n", s->ring_bytes);
+
     audrvClose(&s->drv);
     audrenExit();
     s->audren_inited = 0;
@@ -213,26 +202,16 @@ static aaudio_result_t open_audren(AAudioStream *s) {
 
   s->mempool_id = audrvMemPoolAdd(&s->drv, s->ring, s->ring_bytes);
   if (s->mempool_id < 0) {
-    debugPrintf("aaudio: audrvMemPoolAdd failed\n");
+
     goto fail_pool;
   }
   audrvMemPoolAttach(&s->drv, s->mempool_id);
 
-  // final output mix on the default device, full gain on both channels.
-  // NOTE(on-device): the exact audrvVoiceInit signature
-  // (drv, id, channel_count, PcmFormat, sample_rate) and the
-  // SetDestinationMix(drv, id, AUDREN_FINAL_MIX_ID) constant should be
-  // re-checked against the installed libnx headers; values below are the
-  // documented audrv API.
+  // Route the voice to the default output mix.
   static const u8 sink_channels[] = { 0, 1 };
-  int sink_id = audrvDeviceSinkAdd(&s->drv, AUDREN_DEFAULT_DEVICE_NAME,
-                                   s->channel_count, sink_channels);
-  if (sink_id < 0)
-    debugPrintf("aaudio: audrvDeviceSinkAdd failed (continuing)\n");
-
-  rc = audrvUpdate(&s->drv);
-  if (R_FAILED(rc))
-    debugPrintf("aaudio: initial audrvUpdate failed: 0x%x\n", rc);
+  audrvDeviceSinkAdd(&s->drv, AUDREN_DEFAULT_DEVICE_NAME,
+                     s->channel_count, sink_channels);
+  audrvUpdate(&s->drv);
 
   s->voice_id = 0;
   PcmFormat pcm = (s->format == AAUDIO_FORMAT_PCM_I16) ? PcmFormat_Int16
@@ -240,8 +219,7 @@ static aaudio_result_t open_audren(AAudioStream *s) {
   bool ok = audrvVoiceInit(&s->drv, s->voice_id, s->channel_count, pcm,
                            (float)s->sample_rate);
   if (!ok && s->format != AAUDIO_FORMAT_PCM_I16) {
-    // audren refused FLOAT -- fall back to s16 and convert in the thread.
-    debugPrintf("aaudio: FLOAT voice refused, falling back to PCM_I16\n");
+    // Audren may reject float output.
     s->format = AAUDIO_FORMAT_PCM_I16;
     // resize ring for the now-smaller frame size
     free(s->ring);
@@ -260,7 +238,7 @@ static aaudio_result_t open_audren(AAudioStream *s) {
                         PcmFormat_Int16, (float)s->sample_rate);
   }
   if (!ok) {
-    debugPrintf("aaudio: audrvVoiceInit failed\n");
+
     goto fail_voice;
   }
 
@@ -276,21 +254,13 @@ static aaudio_result_t open_audren(AAudioStream *s) {
 
   audrvUpdate(&s->drv);
 
-  // ★ THE renderer must be explicitly started. Without audrenStartAudioRenderer()
-  // everything above succeeds -- mempool attached, sink added, voice started, the
-  // playback thread happily pulls samples and audrvUpdate() returns OK -- but
-  // audren never actually renders and the console stays SILENT. This one missing
-  // call was why the port had no sound despite a complete audio path.
   rc = audrenStartAudioRenderer();
   if (R_FAILED(rc)) {
-    debugPrintf("aaudio: audrenStartAudioRenderer failed: 0x%x\n", rc);
+
     goto fail_voice;
   }
 
-  debugPrintf("aaudio: audren ready: %d Hz %d ch %s, block %zu B x %d wavebufs, "
-              "renderer STARTED\n", s->sample_rate, s->channel_count,
-              (s->format == AAUDIO_FORMAT_PCM_I16) ? "s16" : "float",
-              s->block_bytes, NUM_WAVEBUFS);
+
   return AAUDIO_OK;
 
 fail_voice:
@@ -312,7 +282,7 @@ aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder *b,
   if (!b || !stream) return AAUDIO_ERROR_NULL;
   if (!b->data_cb) {
     // AAudioMod always sets a data callback; without it we have no source.
-    debugPrintf("aaudio: openStream with no data callback\n");
+
     return AAUDIO_ERROR_NULL;
   }
 
@@ -329,10 +299,11 @@ aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder *b,
   s->mempool_id = -1;
   s->voice_id   = -1;
   mutexInit(&s->lock);
+  mutexInit(&s->control_lock);
+  mutexInit(&s->driver_lock);
   condvarInit(&s->state_cv);
 
-  debugPrintf("aaudio: (AAudioMod) Creating stream %dHz %dch fmt=%d cb=%d\n",
-              s->sample_rate, s->channel_count, s->format, s->frames_per_cb);
+
 
   aaudio_result_t r = open_audren(s);
   if (r != AAUDIO_OK) {
@@ -361,47 +332,54 @@ static int wavebuf_is_free(AudioDriverWaveBuf *wb) {
          wb->state == AudioDriverWaveBufState_Done;
 }
 
+static int stream_is_running(AAudioStream *s) {
+  return __atomic_load_n(&s->running, __ATOMIC_ACQUIRE) &&
+         !__atomic_load_n(&s->closing, __ATOMIC_ACQUIRE);
+}
+
 static void *playback_thread(void *arg) {
   AAudioStream *s = (AAudioStream *)arg;
 
-  // keep audio off the GS performance cores (which the core pins itself); a
-  // background core avoids starving the renderer -- the lswtcs stutter lesson.
   pthr_pin_bg_core();
-  pthr_ensure_fake_tls();  // data_cb runs core code; needs a valid TLS cookie
+  pthr_ensure_fake_tls();
 
   set_state(s, AAUDIO_STREAM_STATE_STARTED);
-  debugPrintf("aaudio: (AAudioMod) Starting stream...\n");
 
-  while (s->running) {
+
+  while (stream_is_running(s)) {
     AudioDriverWaveBuf *wb = &s->wavebufs[s->next_buf];
-    if (!wavebuf_is_free(wb)) {
+    mutexLock(&s->driver_lock);
+    const int free = wavebuf_is_free(wb);
+    mutexUnlock(&s->driver_lock);
+    if (!free) {
       // all slots in flight -- wait one audren mix tick and re-poll.
       audrenWaitFrame();
-      audrvUpdate(&s->drv);
+      if (!stream_is_running(s))
+        break;
+      mutexLock(&s->driver_lock);
+      if (stream_is_running(s))
+        audrvUpdate(&s->drv);
+      mutexUnlock(&s->driver_lock);
       continue;
     }
 
-    // PULL: the core fills `numFrames` interleaved frames into our block, IN THE
-    // STREAM'S NEGOTIATED FORMAT. AAudioMod asks for fmt=1 == AAUDIO_FORMAT_PCM_I16,
-    // so it writes int16 directly. The old code assumed the core always emitted
-    // float: it handed the callback a float scratch buffer, then reinterpreted the
-    // int16 bytes it wrote as floats and "converted" them -- pure garbage, which is
-    // why audio was a loud noise. The voice is already PcmFormat_Int16 to match, so
-    // just let the core fill the wavebuf block directly. No conversion, either way.
+    // The callback writes in the negotiated stream format.
     void *block = (uint8_t *)s->ring + (size_t)s->next_buf * s->block_bytes;
     void *cb_dst = block;
 
-    // data_cb runs CORE code and can block on a core lock the VM-reset thread
-    // holds while it is stopping us -> flag it so stop_playback_thread can tell a
-    // wedged-in-core thread from a clean one and detach instead of deadlocking.
-    __atomic_store_n(&s->in_data_cb, 1, __ATOMIC_RELEASE);
     aaudio_data_callback_result_t cr =
         s->data_cb((AAudioStream *)s, s->data_user, cb_dst, s->frames_per_cb);
-    __atomic_store_n(&s->in_data_cb, 0, __ATOMIC_RELEASE);
 
+    if (!stream_is_running(s))
+      break;
 
     // hand the freshly filled block to audren.
     armDCacheFlush(block, s->block_bytes);
+    mutexLock(&s->driver_lock);
+    if (!stream_is_running(s)) {
+      mutexUnlock(&s->driver_lock);
+      break;
+    }
     memset(wb, 0, sizeof(*wb));
     wb->data_raw      = s->ring;
     wb->size          = s->ring_bytes;
@@ -409,38 +387,13 @@ static void *playback_thread(void *arg) {
     wb->end_sample_offset   = wb->start_sample_offset + s->frames_per_cb;
     audrvVoiceAddWaveBuf(&s->drv, s->voice_id, wb);
     audrvUpdate(&s->drv);
-
-    // Prove samples are actually flowing (and that they're not all silence).
-    {
-      static unsigned fed = 0;
-      if (fed < 3 || (fed & 0x1ff) == 0) {
-        float peak = 0.f;
-        const int n = s->frames_per_cb * s->channel_count;
-        if (s->format == AAUDIO_FORMAT_PCM_I16) {
-          const int16_t *p = (const int16_t *)block;
-          for (int i = 0; i < n; i++) {
-            float a = (p[i] < 0 ? -(float)p[i] : (float)p[i]) / 32768.0f;
-            if (a > peak) peak = a;
-          }
-        } else {
-          const float *f = (const float *)block;
-          for (int i = 0; i < n; i++) {
-            float a = f[i] < 0 ? -f[i] : f[i];
-            if (a > peak) peak = a;
-          }
-        }
-        debugPrintf("aaudio: fed block #%u (%d frames, %s) peak=%.3f\n", fed,
-                    s->frames_per_cb,
-                    (s->format == AAUDIO_FORMAT_PCM_I16) ? "s16" : "f32", peak);
-      }
-      fed++;
-    }
+    mutexUnlock(&s->driver_lock);
 
     s->frames_read += s->frames_per_cb;   // monotonic; AAudioStream_getFramesRead
     s->next_buf = (s->next_buf + 1) % NUM_WAVEBUFS;
 
     if (cr == AAUDIO_CALLBACK_RESULT_STOP) {
-      s->running = 0;
+      __atomic_store_n(&s->running, 0, __ATOMIC_RELEASE);
       break;
     }
 
@@ -448,24 +401,16 @@ static void *playback_thread(void *arg) {
     audrenWaitFrame();
   }
 
-  debugPrintf("aaudio: playback thread exit (frames_read=%lld)\n",
-              (long long)s->frames_read);
+
   __atomic_store_n(&s->thread_exited, 1, __ATOMIC_RELEASE);
   return NULL;
 }
 
-// Stop the playback thread WITHOUT deadlocking. The core calls requestStop/close
-// from a VM-reset context while (sometimes) holding a lock that data_cb -- which
-// runs on the playback thread -- is blocked on; a bare pthread_join then hangs
-// the whole VM forever (observed: "Stopping stream..." was the last log line, no
-// thread-exit, no progress for 25s). So: signal stop, then wait up to ~1.5s for a
-// clean exit and join; if the thread is wedged inside the core callback, DETACH
-// and return so the reset can proceed -- which releases the lock and lets the
-// detached thread drain and exit on its own. Returns 1 if joined, 0 if detached.
+// Do not block VM reset on a callback that is waiting for a core lock.
 static int stop_playback_thread(AAudioStream *s) {
   if (!s->thread_started) return 1;
   __atomic_store_n(&s->running, 0, __ATOMIC_RELEASE);
-  for (int i = 0; i < 300; i++) { // 300 * 5ms = 1.5s
+  for (int i = 0; i < 300; i++) {
     if (__atomic_load_n(&s->thread_exited, __ATOMIC_ACQUIRE)) {
       pthread_join(s->thread, NULL);
       s->thread_started = 0;
@@ -473,8 +418,7 @@ static int stop_playback_thread(AAudioStream *s) {
     }
     svcSleepThread(5000000ULL);
   }
-  debugPrintf("aaudio: playback thread wedged (in_data_cb=%d); detaching to "
-              "avoid VM-reset deadlock\n", s->in_data_cb);
+
   pthread_detach(s->thread);
   s->thread_started = 0;
   s->thread_detached = 1;
@@ -487,15 +431,21 @@ static int stop_playback_thread(AAudioStream *s) {
 
 aaudio_result_t AAudioStream_requestStart(AAudioStream *s) {
   if (!s) return AAUDIO_ERROR_NULL;
-  debugPrintf("aaudio: (AAudioMod) requestStart\n");
+  mutexLock(&s->control_lock);
+  if (__atomic_load_n(&s->closing, __ATOMIC_ACQUIRE)) {
+    mutexUnlock(&s->control_lock);
+    return AAUDIO_ERROR_DISCONNECTED;
+  }
+
   set_state(s, AAUDIO_STREAM_STATE_STARTING);
 
+  if (s->thread_started && __atomic_load_n(&s->thread_exited, __ATOMIC_ACQUIRE)) {
+    pthread_join(s->thread, NULL);
+    s->thread_started = 0;
+  }
   if (s->thread_started) {
-    // resume from pause: unpause the voice and let the loop pull again.
-    s->running = 1;
-    audrvVoiceSetPaused(&s->drv, s->voice_id, false);
-    audrvUpdate(&s->drv);
     set_state(s, AAUDIO_STREAM_STATE_STARTED);
+    mutexUnlock(&s->control_lock);
     return AAUDIO_OK;
   }
 
@@ -505,64 +455,98 @@ aaudio_result_t AAudioStream_requestStart(AAudioStream *s) {
     for (int i = 0; i < 400 && !__atomic_load_n(&s->thread_exited, __ATOMIC_ACQUIRE); i++)
       svcSleepThread(5000000ULL); // wait up to 2s for the old thread to drain
     if (!__atomic_load_n(&s->thread_exited, __ATOMIC_ACQUIRE)) {
-      debugPrintf("aaudio: requestStart: previous playback thread still wedged; refusing\n");
+
       set_state(s, AAUDIO_STREAM_STATE_OPEN);
+      mutexUnlock(&s->control_lock);
       return AAUDIO_ERROR_UNAVAILABLE;
     }
   }
   s->thread_detached = 0;
   s->thread_exited = 0;   // fresh thread; must be cleared BEFORE pthread_create
-  s->in_data_cb = 0;
 
-  s->running = 1;
+  mutexLock(&s->driver_lock);
+  if (!s->audren_inited) {
+    mutexUnlock(&s->driver_lock);
+    mutexUnlock(&s->control_lock);
+    return AAUDIO_ERROR_DISCONNECTED;
+  }
+  if (s->voice_id >= 0) {
+    audrvVoiceStart(&s->drv, s->voice_id);
+    audrvUpdate(&s->drv);
+  }
+  mutexUnlock(&s->driver_lock);
+  __atomic_store_n(&s->running, 1, __ATOMIC_RELEASE);
   // spawn via newlib pthreads directly (this is OUR thread, not core-spawned);
   // it pins itself to a bg core in playback_thread.
   int rc = pthread_create(&s->thread, NULL, playback_thread, s);
   if (rc != 0) {
-    s->running = 0;
-    debugPrintf("aaudio: pthread_create failed: %d\n", rc);
+    __atomic_store_n(&s->running, 0, __ATOMIC_RELEASE);
+
     set_state(s, AAUDIO_STREAM_STATE_OPEN);
+    mutexUnlock(&s->control_lock);
     return AAUDIO_ERROR_UNAVAILABLE;
   }
   s->thread_started = 1;
   // playback_thread sets STATE_STARTED once it's running.
+  mutexUnlock(&s->control_lock);
   return AAUDIO_OK;
 }
 
 aaudio_result_t AAudioStream_requestPause(AAudioStream *s) {
   if (!s) return AAUDIO_ERROR_NULL;
-  debugPrintf("aaudio: (AAudioMod) Requesting pause...\n");
+  mutexLock(&s->control_lock);
+  if (__atomic_load_n(&s->closing, __ATOMIC_ACQUIRE)) {
+    mutexUnlock(&s->control_lock);
+    return AAUDIO_ERROR_DISCONNECTED;
+  }
+
   set_state(s, AAUDIO_STREAM_STATE_PAUSING);
-  // stop pulling but keep the thread alive so a later start just unpauses.
-  s->running = 0;
+  stop_playback_thread(s);
+  mutexLock(&s->driver_lock);
   if (s->voice_id >= 0) {
     audrvVoiceSetPaused(&s->drv, s->voice_id, true);
     audrvUpdate(&s->drv);
   }
+  mutexUnlock(&s->driver_lock);
   set_state(s, AAUDIO_STREAM_STATE_PAUSED);
+  mutexUnlock(&s->control_lock);
   return AAUDIO_OK;
 }
 
 aaudio_result_t AAudioStream_requestStop(AAudioStream *s) {
   if (!s) return AAUDIO_ERROR_NULL;
-  debugPrintf("aaudio: (AAudioMod) Stopping stream...\n");
+  mutexLock(&s->control_lock);
+  if (__atomic_load_n(&s->closing, __ATOMIC_ACQUIRE)) {
+    mutexUnlock(&s->control_lock);
+    return AAUDIO_ERROR_DISCONNECTED;
+  }
+
   set_state(s, AAUDIO_STREAM_STATE_STOPPING);
   stop_playback_thread(s);
+  mutexLock(&s->driver_lock);
   if (s->voice_id >= 0) {
     audrvVoiceStop(&s->drv, s->voice_id);
     audrvUpdate(&s->drv);
   }
+  mutexUnlock(&s->driver_lock);
   set_state(s, AAUDIO_STREAM_STATE_STOPPED);
+  mutexUnlock(&s->control_lock);
   return AAUDIO_OK;
 }
 
 aaudio_result_t AAudioStream_close(AAudioStream *s) {
   if (!s) return AAUDIO_ERROR_NULL;
-  debugPrintf("aaudio: (AAudioMod) Closing stream...\n");
+  mutexLock(&s->control_lock);
+  if (__atomic_exchange_n(&s->closing, 1, __ATOMIC_ACQ_REL)) {
+    mutexUnlock(&s->control_lock);
+    return AAUDIO_OK;
+  }
+
   set_state(s, AAUDIO_STREAM_STATE_CLOSING);
 
   int joined = stop_playback_thread(s);
 
+  mutexLock(&s->driver_lock);
   if (s->audren_inited) {
     if (s->voice_id >= 0)
       audrvVoiceStop(&s->drv, s->voice_id);
@@ -576,17 +560,20 @@ aaudio_result_t AAudioStream_close(AAudioStream *s) {
     audrenExit();
     s->audren_inited = 0;
   }
+  mutexUnlock(&s->driver_lock);
 
   set_state(s, AAUDIO_STREAM_STATE_CLOSED);
   // If we had to detach a wedged playback thread and it still hasn't exited, it
   // may still touch `s`/`s->ring` -> leak them rather than free-then-UAF. This is
   // a rare teardown-race path; a one-shot leak at VM reset/exit is acceptable.
   if (!joined && !__atomic_load_n(&s->thread_exited, __ATOMIC_ACQUIRE)) {
-    debugPrintf("aaudio: leaking stream (detached playback thread still live)\n");
+
+    mutexUnlock(&s->control_lock);
     return AAUDIO_OK;
   }
   free(s->ring);
-  free(s);
+  s->ring = NULL;
+  mutexUnlock(&s->control_lock);
   return AAUDIO_OK;
 }
 

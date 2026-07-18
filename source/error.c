@@ -23,8 +23,6 @@ void fatal_error(const char *fmt, ...) {
   vsnprintf(msg, sizeof(msg), fmt, list);
   va_end(list);
 
-  debugPrintf("FATAL: %s\n", msg); // captured in debug.log before the dialog
-
   PadState pad;
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
   padInitializeDefault(&pad);
